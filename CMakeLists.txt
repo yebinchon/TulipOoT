@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.4.3)
-project(CudaFE)
+project(TulipOoT)
 
 # need at least c++11 to compile successfully, I chose c++17 just to be cool
 set (CMAKE_CXX_STANDARD 17)
+set (CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # maybe not needed, but just to be safe
 set(CMAKE_C_COMPILER "clang")
@@ -27,3 +28,4 @@ list(APPEND TVM_LINKER_LIBS LLVM)
 add_subdirectory(MergeKernel)
 add_subdirectory(NoelleReduction)
 add_subdirectory(NoelleDOALL)
+add_subdirectory(OutlineKernel)
