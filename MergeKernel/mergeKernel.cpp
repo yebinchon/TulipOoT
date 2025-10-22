@@ -495,7 +495,6 @@ struct MergeKernel : public ModulePass {
                         if(calledF->getName().contains("cudaLaunch")){
                           kernelProfiles[CI]->kernelCall = ci;
                           kernelCall = ci;
-                          funcs2delete.insert(calledF);
                           break;
                         }
                       }
