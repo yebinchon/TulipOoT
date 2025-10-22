@@ -1,3 +1,10 @@
+#include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/Pass.h"
 #include "llvm/IR/Function.h"
 #include "llvm/Support/raw_ostream.h"
@@ -13,10 +20,16 @@
 #include <set>
 #include <stack>
 #include <map>
+#include <string>
 #include "IDMap.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/IR/Operator.h"
+
+// YEBIN: added libs
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/Demangle/Demangle.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 using namespace llvm;
 
@@ -37,8 +50,16 @@ struct MergeKernel : public ModulePass {
   static char ID;
   std::set<Function*>funcs2delete;
   std::map<Function*, Function*> device2newFunc;
+  std::map<Function*, std::set<Instruction*>>syncInsts;
+  std::set<Function*>syncFuncs;
+  std::map<Function*, std::set<CallInst*>>kernelCalls;
   int mdID = 0;
   MergeKernel() : ModulePass(ID) {}
+
+  void getAnalysisUsage(AnalysisUsage &AU) const {
+    AU.addRequired<LoopInfoWrapperPass>();
+    AU.addRequired<DominatorTreeWrapperPass>();
+  }
 
   void findThreadDim(KernelProfile *kernelProfile, Function &F, LoadInst *DimArg, bool isBlockDim){
     //LoadInst *DimArg = dyn_cast<LoadInst>(CI->getArgOperand(2));
@@ -175,6 +196,162 @@ struct MergeKernel : public ModulePass {
     }
   }
 
+  void splitFunction(LLVMContext &Context, Function* F, std::set<Instruction*> insts) {
+    IRBuilder<> Builder(Context);
+    unsigned barrierCount = insts.size();
+    auto orignalName = F->getName();
+    F->setName(orignalName+"0");
+
+    // Order needs to be later instructions first
+    // Is it preserved?
+    for(auto it = insts.rbegin(); it != insts.rend(); it++) {
+      Instruction *syncInst = *it;
+      auto *BB = syncInst->getParent();
+      auto *splitPoint = BB->splitBasicBlock(syncInst, "syncpoint."+std::to_string(barrierCount));
+      auto* LI = &getAnalysis<LoopInfoWrapperPass>(*F).getLoopInfo();
+      // create new kernel function
+      auto *newFunc = Function::Create(
+            F->getFunctionType(),
+            F->getLinkage(),
+            orignalName+std::to_string(barrierCount--),
+            F->getParent()
+          );
+      //copy old kernel over to the new
+      ValueToValueMapTy VMap;
+      auto NewFArgIt = newFunc->arg_begin();
+      for (auto &Arg: F->args()) {
+        auto ArgName = Arg.getName();
+        NewFArgIt->setName(ArgName);
+        VMap[&Arg] = &(*NewFArgIt++);
+      }
+
+      SmallVector<ReturnInst*, 8> Returns;
+      llvm::CloneFunctionInto(newFunc, F, VMap, false, Returns);
+      auto *newBB = cast<Instruction>(*VMap[BB->getTerminator()]).getParent();
+      auto *newSplitBB = cast<Instruction>(*VMap[splitPoint->getTerminator()]).getParent();
+
+      // call newly split function
+      for(auto *callInst: kernelCalls[F]) {
+        Builder.SetInsertPoint(callInst->getNextNode());
+        std::vector<Value*> args;
+        for(auto &arg: callInst->args()) args.push_back(arg);
+        Builder.CreateCall(newFunc, args);
+      }
+
+      // prune function body based on barrier
+      // FIXME: currently assumes the synchronization is not within a loop
+      assert(!LI->getLoopFor(BB) && "The synchronization point is in a loop!!!\n");
+
+      // all predecessors of splitPoint (not inclusive) are part of prevF
+      // others are part of splitF
+      Builder.SetInsertPoint(BB->getTerminator());
+      Builder.CreateRetVoid();
+      BB->getTerminator()->eraseFromParent();
+
+      std::set<BasicBlock*> prevEraseList;
+      std::set<BasicBlock*> splitEraseList;
+      // workaround for use-def errors
+      for(df_iterator<BasicBlock*> SI = df_begin(splitPoint); SI != df_end(splitPoint); ++SI) {
+        BasicBlock* succ = *SI;
+        prevEraseList.insert(succ);
+      }
+      for(auto &bb: prevEraseList) {
+        Builder.SetInsertPoint(bb->getTerminator());
+        Builder.CreateRetVoid();
+        bb->getTerminator()->eraseFromParent();
+      }
+      for(auto &bb: prevEraseList) bb->eraseFromParent();
+
+      // All successors of splitPoint (inclusive) are part of splitF
+      // Previous instruction must also be considered
+      // FIXME: assumes all "setup" insts are in the entry block
+      // TODO: Live-in Live-out analyses, modify function signature
+      for(idf_iterator<BasicBlock*> PI = idf_begin(newBB); PI != idf_end(newBB); ++PI) {
+        BasicBlock* pred = *PI;
+        if (pred != &newFunc->getEntryBlock())
+          splitEraseList.insert(pred);
+      }
+      // handle entry block seperately
+      Builder.SetInsertPoint(newFunc->getEntryBlock().getTerminator());
+      Builder.CreateBr(newSplitBB);
+      newFunc->getEntryBlock().getTerminator()->eraseFromParent();
+      // same as prevF
+      for(auto &bb: splitEraseList) {
+        Builder.SetInsertPoint(bb->getTerminator());
+        Builder.CreateRetVoid();
+        bb->getTerminator()->eraseFromParent();
+      }
+      for(auto &bb: splitEraseList) bb->eraseFromParent();
+    }
+  }
+
+  // Copied from LoopSimplify pass
+  BasicBlock* makeLoopPreheader(LoopInfo& LI, DominatorTree& DT, Loop* L) {
+    BasicBlock *header = L->getHeader();
+
+    std::vector<BasicBlock*> enteringBBs;
+    for(pred_iterator PI = pred_begin(header); PI != pred_end(header); ++PI) {
+      if(!L->contains(*PI))
+        enteringBBs.push_back(*PI);
+    }
+
+    BasicBlock *preheader = SplitBlockPredecessors(header, enteringBBs, ".preheader");
+
+    if(Loop* parent = L->getParentLoop())
+      parent->addBasicBlockToLoop(preheader, LI);
+
+    DT.splitBlock(preheader);
+
+    return preheader;
+  }
+
+  void splitLoop(LLVMContext &Context, CallInst *I, unsigned cloneNum) {
+    IRBuilder<> Builder(Context);
+    // Duplicate the kernel call loop
+    // FIXME: Assume a 2d grid for now...
+    auto *F = I->getFunction();
+    auto &LI = getAnalysis<LoopInfoWrapperPass>(*F).getLoopInfo();
+    auto &DT = getAnalysis<DominatorTreeWrapperPass>(*F).getDomTree();
+    auto threadLoop = LI.getLoopFor(I->getParent());
+    // insert preheader if it does not exist
+    if(!threadLoop->getLoopPreheader()) {
+      BasicBlock *preheader = makeLoopPreheader(LI, DT, threadLoop);
+      errs() << threadLoop->getLoopPreheader()->getName() << "\n";
+    }
+    // assume single predecessor of preheader (one entrance from outer loop)
+    auto *entering = threadLoop->getLoopPreheader()->getSinglePredecessor();
+    assert(entering && "Not a single predecessor of preheader!!!\n");
+
+    Loop* prevLoop = threadLoop;
+    for(unsigned i = 0; i < cloneNum; i++) {
+      errs() << "CLONING " << i << "\n"; 
+      ValueToValueMapTy VMap;
+      SmallVector<BasicBlock* , 4> newBlocks;
+      auto *newLoop = cloneLoopWithPreheader(prevLoop->getLoopPreheader(), &F->getEntryBlock(), threadLoop, VMap, ".clone"+std::to_string(i), &LI, &DT, newBlocks);
+      remapInstructionsInBlocks(newBlocks, VMap);
+      entering->getTerminator()->replaceUsesOfWith(prevLoop->getLoopPreheader(), newLoop->getLoopPreheader());
+      newLoop->getHeader()->getTerminator()->replaceUsesOfWith(threadLoop->getExitBlock(), prevLoop->getLoopPreheader());
+      auto* call = cast<Instruction>(VMap[I]);
+      for(unsigned j = 0; j <= cloneNum; j++) {
+        auto* tempCall = call;
+        call = call->getNextNode();
+        errs() << "IDX: " << i+j << "\n";
+        if(j+i != cloneNum - 1)
+          tempCall->eraseFromParent();
+      }
+
+      prevLoop = newLoop;
+    }
+    // Original loop, now last one
+    for(unsigned j = 0; j < cloneNum; j++) {
+      auto* tempI = I;
+      CallInst* CI = dyn_cast<CallInst>(I->getNextNode());
+      assert(CI && "Next inst is not a CallInst!!\n");
+      I = CI;
+      tempI->eraseFromParent();
+    }
+  }
+
   bool runOnModule(Module &M) override {
     //transform target
     for (Module::iterator FI = M.begin(), FE = M.end(); FI != FE; ++FI) {
@@ -190,10 +367,14 @@ struct MergeKernel : public ModulePass {
       for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I) {
         if(CallInst *CI = dyn_cast<CallInst>(&*I)){
           Function* calledFunc = CI->getCalledFunction();
+          // Collect sync functions
           if(calledFunc->getName().contains("llvm.nvvm.barrier")){
-            funcs2delete.insert(calledFunc);
-            insts2Remove.push_back(CI);
+            syncFuncs.insert(calledFunc);
+            syncInsts[F].insert(CI);
+            //funcs2delete.insert(calledFunc);
+            //insts2Remove.push_back(CI);
           }
+          //if(calledFunc->getName().contains("checkCudaError"))
           else if (calledFunc->getName().contains("llvm.nvvm.fmax")){
             errs() << "mergeKernel: found nvvm fmax declaration\n";
             auto sqrtFuncTy = calledFunc->getFunctionType();
@@ -265,6 +446,7 @@ struct MergeKernel : public ModulePass {
            // auto ptr = CI->getArgOperand(0);
            // CallInst::CreateFree(ptr, CI);
             insts2Remove.push_back(CI);
+            funcs2delete.insert(calledFunc);
         }
         else if(calledFunc->getName().contains("cudaConfigureCall")){
             //temporous registers
@@ -313,6 +495,7 @@ struct MergeKernel : public ModulePass {
                         if(calledF->getName().contains("cudaLaunch")){
                           kernelProfiles[CI]->kernelCall = ci;
                           kernelCall = ci;
+                          funcs2delete.insert(calledF);
                           break;
                         }
                       }
@@ -326,6 +509,7 @@ struct MergeKernel : public ModulePass {
                 assert(kernelCall && "mergeKernel: din't find kernel call!\n");
                 errs() << "mergeKernel: kernel call: " << *(kernelCall) << "\n";
                 insts2Remove.push_back(cmp);
+                funcs2delete.insert(calledFunc);
             }
           }
 
@@ -406,13 +590,18 @@ struct MergeKernel : public ModulePass {
                   ArrayRef<Type*>(argTys), //arg types;
                   false
                 );
+            std::string newName = demangle(deviceKernel->getName());
+            newName = newName.substr(0, newName.find("("));
             kernelProfiles[CI]->newFunc = Function::Create(
                   funcTy,
                   deviceKernel->getLinkage(),
-                  deviceKernel->getName(),
+                  newName,
+                  //deviceKernel->getName(),
                   deviceKernel->getParent()
                 );
             newFunc = kernelProfiles[CI]->newFunc;
+            //errs() << "DEVICEKERNEL " << deviceKernel->getName() << "\n";
+            //errs() << "NEWFUNC      " << newFunc->getName() << "\n";
             device2newFunc[deviceKernel] = newFunc;
             deviceKernel->setSubprogram(nullptr);
 
@@ -430,6 +619,14 @@ struct MergeKernel : public ModulePass {
             llvm::CloneFunctionInto(newFunc, deviceKernel, VMap, false, Returns);
             errs() << *(newFunc) << "\n";
 
+            // find sync insts inside new kernel
+            auto syncInstList = syncInsts[deviceKernel];
+            for(auto* inst: syncInstList) {
+              if(isa<Instruction>(VMap[inst]))
+                syncInsts[newFunc].insert(cast<Instruction>(VMap[inst]));
+            }
+            syncInsts.erase(deviceKernel);
+            
             ////remove the use of the argument in device kernel
             //std::vector<Instruction*> uses2remove;
             //for(auto arg = deviceKernel->arg_begin(); arg != deviceKernel->arg_end(); ++arg) {
@@ -544,6 +741,8 @@ struct MergeKernel : public ModulePass {
               I->eraseFromParent();
             }
             insts2Remove.push_back(CI);
+            errs() << "YEBIN: CALLEDFUNC = " << calledFunc->getName() << "\n";
+            funcs2delete.insert(calledFunc);
           }
           else if(calledFunc->getName().contains("cudaMalloc") && calledFunc->getName() != "cudaMalloc"){
             //auto devDataPtr = CI->getArgOperand(0);
@@ -706,6 +905,7 @@ struct MergeKernel : public ModulePass {
             //mode->isOne() ? dest->setMetadata("tulip.target.mapdata.to", N) :
             //                dest->setMetadata("tulip.target.mapdata.from", N);
           }
+          //TODO: handle cudaDeviceSynchronize
           else if(calledFunc->getName().contains("cudaDeviceSynchronize")){
             insts2Remove.push_back(CI);
           }
@@ -913,6 +1113,7 @@ struct MergeKernel : public ModulePass {
               kernelCall //insert before
             );
           insts2Remove.push_back(kernelCall);
+          kernelCalls[newFunc].insert(newKernelCall);
       }
 
        //delete cuda calls and control flows
@@ -922,8 +1123,10 @@ struct MergeKernel : public ModulePass {
     }
 
     //delete functions
-    for(auto f : funcs2delete)
+    for(auto f : funcs2delete) {
       f->eraseFromParent();
+    }
+
 
     //process shared variables
      std::map<Function*, std::set<Instruction*>> func2SharedMems;
@@ -1014,7 +1217,14 @@ struct MergeKernel : public ModulePass {
          errs() << "mergeKernel: sharedMemvar: " << *var << "\n";
      }
 
-    return false;
+    //Split function at synchronization points
+    for(auto [func, insts]: syncInsts) {
+      splitFunction(M.getContext(), func, insts);
+      for(auto callinst: kernelCalls[func])
+        splitLoop(M.getContext(), callinst, insts.size());
+    }
+    
+    return true;
   }
 }; // end of struct Hello
 }  // end of anonymous namespace
