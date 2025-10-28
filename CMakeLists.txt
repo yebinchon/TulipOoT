@@ -4,6 +4,7 @@ project(TulipOoT)
 # need at least c++11 to compile successfully, I chose c++17 just to be cool
 set (CMAKE_CXX_STANDARD 17)
 set (CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(LLVM_LINK_COMPONENTS Demangle)
 
 # maybe not needed, but just to be safe
 set(CMAKE_C_COMPILER "clang")

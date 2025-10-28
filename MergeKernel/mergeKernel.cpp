@@ -736,11 +736,10 @@ struct MergeKernel : public ModulePass {
 
             for(auto I : cudaCall2remove){
               errs() << "mergeKernel: cudaCall2remove: " << *I << "\n";
-              errs() << "mergeKernel: what does I belong to?" <<  I->getParent()->getName();
+              errs() << "mergeKernel: what do I belong to?\n\t" <<  I->getParent()->getName();
               I->eraseFromParent();
             }
             insts2Remove.push_back(CI);
-            errs() << "YEBIN: CALLEDFUNC = " << calledFunc->getName() << "\n";
             funcs2delete.insert(calledFunc);
           }
           else if(calledFunc->getName().contains("cudaMalloc") && calledFunc->getName() != "cudaMalloc"){
@@ -766,18 +765,29 @@ struct MergeKernel : public ModulePass {
           }
           else if(calledFunc->getName().contains("cudaMemcpy")){
             ConstantInt* mode = dyn_cast<ConstantInt>(CI->getArgOperand(3));
-            Instruction* originalBitcast = nullptr;
-            mode->isOne()? originalBitcast = dyn_cast<BitCastInst>(CI->getArgOperand(1)) :
-                           originalBitcast = dyn_cast<BitCastInst>(CI->getArgOperand(0));
-            Instruction* devBitcast = nullptr;
-            mode->isOne()? devBitcast = dyn_cast<BitCastInst>(CI->getArgOperand(0)) :
-                           devBitcast = dyn_cast<BitCastInst>(CI->getArgOperand(1));
-            assert(originalBitcast && devBitcast && "mergeKernel: didn't find bitcast from cudaMemcpy!\n");
-            LoadInst *devLd = dyn_cast<LoadInst>(devBitcast->getOperand(0));
-            LoadInst *originalLd = dyn_cast<LoadInst>(originalBitcast->getOperand(0));
-            assert(originalLd && devLd && "mergeKernel: didn't find load from cudaMemcpy!\n");
-            AllocaInst *devAlloc = dyn_cast<AllocaInst>(devLd->getOperand(0));
-            AllocaInst *originalAlloc = dyn_cast<AllocaInst>(originalLd->getOperand(0));
+            Value* originalMem = mode->isOne() ? CI->getArgOperand(1) : CI->getArgOperand(0);
+            LoadInst* originalLd = nullptr;
+            AllocaInst* originalAlloc = nullptr;
+            if(Instruction* originalBitcast = dyn_cast<BitCastInst>(originalMem)) 
+              originalLd = dyn_cast<LoadInst>(originalBitcast->getOperand(0));
+            else
+              originalLd = dyn_cast<LoadInst>(originalMem);
+            if(originalLd)
+              originalAlloc = dyn_cast<AllocaInst>(originalLd->getOperand(0));
+            else
+             originalAlloc = dyn_cast<AllocaInst>(originalMem);
+            Value* devMem = mode->isOne() ? CI->getArgOperand(0) : CI->getArgOperand(1);
+            LoadInst* devLd = nullptr;
+            AllocaInst* devAlloc = nullptr;
+            if(Instruction* devBitcast = dyn_cast<BitCastInst>(devMem)) 
+              devLd = dyn_cast<LoadInst>(devBitcast->getOperand(0));
+            else
+              devLd = dyn_cast<LoadInst>(devMem);
+            if(devLd)
+              devAlloc = dyn_cast<AllocaInst>(devLd->getOperand(0));
+            else
+             devAlloc = dyn_cast<AllocaInst>(devMem);
+            
             assert(devAlloc && originalAlloc && "mergeKernel: didn't find alloca from cudaMemcpy!\n");
             std::map<AllocaInst*, LoadInst>originalAlloc2newLD;
             auto newLd = new LoadInst(cast<PointerType>(originalAlloc->getType())->getElementType(), originalAlloc, "ldHost", originalLd);
@@ -1038,6 +1048,7 @@ struct MergeKernel : public ModulePass {
 
         std::vector<Value*> newKernelArgs;
         auto kernelCall = kernelProfile->kernelCall;
+        errs() << *kernelCall << "\n";
         for(int i=0; i<kernelCall->arg_size(); ++i){
           errs() << "SUSAN: original arg " << *(kernelCall->getArgOperand(i)) << "\n";
           newKernelArgs.push_back(kernelCall->getArgOperand(i));
@@ -1098,10 +1109,18 @@ struct MergeKernel : public ModulePass {
           newKernelArgs.push_back(indvar);
         }
         auto newFunc = kernelProfile->newFunc;
-        errs() << *(newFunc->getFunctionType()) << "\n";
 
+        unsigned count = 0;
         for(auto arg : newKernelArgs){
           errs() << "mergeKernel: new function kernel Args: " << *arg << "\n";
+          count++;
+        }
+        errs() << count << "\n";
+        
+        errs() << newFunc->getFunctionType()->getNumParams() << "\n";
+        errs() << newFunc->getName() << " type: " << *(newFunc->getFunctionType()) << "\n";
+        for(unsigned i = 0; i < newFunc->getFunctionType()->getNumParams(); i++) {
+          errs() << *newFunc->getFunctionType()->getParamType(i) << " " << *newKernelArgs[i] << "\n";
         }
 
         CallInst *newKernelCall = CallInst::Create(
@@ -1113,6 +1132,7 @@ struct MergeKernel : public ModulePass {
             );
           insts2Remove.push_back(kernelCall);
           kernelCalls[newFunc].insert(newKernelCall);
+          errs() << "Finished making call for " << newFunc->getName() << "\n";
       }
 
        //delete cuda calls and control flows
