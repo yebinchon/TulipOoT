@@ -15,6 +15,8 @@
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/GlobalVariable.h"
 
 
 #include <set>
@@ -505,6 +507,7 @@ struct MergeKernel : public ModulePass {
                     break;
                 }
 
+                errs() << "mergeKernel: kernelCall: " << *(kernelCall) << "\n";
                 assert(kernelCall && "mergeKernel: din't find kernel call!\n");
                 errs() << "mergeKernel: kernel call: " << *(kernelCall) << "\n";
                 insts2Remove.push_back(cmp);
@@ -742,7 +745,7 @@ struct MergeKernel : public ModulePass {
             insts2Remove.push_back(CI);
             funcs2delete.insert(calledFunc);
           }
-          else if(calledFunc->getName().contains("cudaMalloc") && calledFunc->getName() != "cudaMalloc"){
+          else if(calledFunc->getName().contains("cudaMalloc")){
             //auto devDataPtr = CI->getArgOperand(0);
             //auto AllocSize = CI->getArgOperand(1);
             //PointerType* Ty = dyn_cast<PointerType>(devDataPtr->getType());
@@ -790,6 +793,7 @@ struct MergeKernel : public ModulePass {
             
             assert(devAlloc && originalAlloc && "mergeKernel: didn't find alloca from cudaMemcpy!\n");
             std::map<AllocaInst*, LoadInst>originalAlloc2newLD;
+            errs() << "ANDREW: mergeKernel: originalLd " << *originalLd << "\n";
             auto newLd = new LoadInst(cast<PointerType>(originalAlloc->getType())->getElementType(), originalAlloc, "ldHost", originalLd);
             Value* cpySize = nullptr;
             errs() << "mergeKernel: found originalAlloc " << *originalAlloc << "\n";
@@ -1147,93 +1151,164 @@ struct MergeKernel : public ModulePass {
     }
 
 
-    //process shared variables
-     std::map<Function*, std::set<Instruction*>> func2SharedMems;
-     std::map<Function*, std::set<GlobalVariable*>> func2SharedGlobs;
-     std::map<GlobalVariable*, std::set<Instruction*>> glob2Insts;
-     std::map<Instruction*, User::op_iterator> inst2opIt;
-     std::map<Instruction*, GEPOperator*> inst2gepOp;
+    //process shared variables - lift to global variables in address space 0
+     std::map<GlobalVariable*, GlobalVariable*> oldGlob2NewGlob; // Map from addrspace(3) to addrspace(0)
+     std::map<ConstantExpr*, GlobalVariable*> addrspacecast2NewGlob; // Map from addrspacecast to new global
+     std::map<GEPOperator*, std::vector<Instruction*>> gepOp2Users; // Map GEPOperator to instructions using it
+     std::vector<GlobalVariable*> globalsToDelete; // Original address space 3 globals to delete
+     std::map<std::string, int> nameCounts; // Track name usage to avoid conflicts
+     
+     auto extractVarName = [](const std::string& mangledName) -> std::string {
+         size_t ePos = mangledName.find_last_of('E');
+         if(ePos != std::string::npos && ePos + 1 < mangledName.length()){
+             size_t startPos = ePos + 1;
+             while(startPos < mangledName.length() && std::isdigit(mangledName[startPos])){
+                 startPos++;
+             }
+             if(startPos < mangledName.length()){
+                 return mangledName.substr(startPos);
+             }
+         }
+         // Fallback: try demangling
+         std::string demangled = demangle(mangledName);
+         if(!demangled.empty() && demangled != mangledName){
+             size_t lastSep = demangled.rfind("::");
+             if(lastSep != std::string::npos && lastSep + 2 < demangled.length()){
+                 return demangled.substr(lastSep + 2);
+             }
+             return demangled;
+         }
+         
+         return mangledName;
+     };
+     
+     // Find all address space 3 globals and create corresponding address space 0 globals
      for (Module::global_iterator I = M.global_begin(), E = M.global_end();
            I != E; ++I) {
          GlobalVariable* globVal = &*I;
          if(!globVal->hasInitializer()) continue;
          if(globVal->getAddressSpace() != 3) continue;
-         for(User *U : globVal->users()){
-           ConstantExpr *UE = dyn_cast<ConstantExpr>(U);
-           errs() << "UE: " << *UE << "\n";
-           if(!UE) continue;
-
-           //find instruction that uses the expr
-           for(User *ExprU : UE->users()){
-              Instruction* UI = dyn_cast<Instruction>(ExprU);
-              errs() << "ExprU: " << *ExprU << "\n";
-              if(!UI){
-                auto gepExpr = dyn_cast<GEPOperator>(ExprU);
-                if(!gepExpr) continue;
-                for(auto gepU : gepExpr->users()){
-                  auto LI = dyn_cast<Instruction>(gepU);
-                  if(!LI) continue;
-                  inst2gepOp[LI] = gepExpr;
-                }
-                continue;
-              }
-              Function *func = UI->getParent()->getParent();
-              func2SharedMems[func].insert(UI);
-              glob2Insts[globVal].insert(UI);
-              func2SharedGlobs[func].insert(globVal);
-
-              for (auto OI = UI->op_begin(), OE = UI->op_end(); OI != OE; ++OI){
-                Value *val = *OI;
-                if(val == UE)
-                  inst2opIt[UI] = OI;
-              }
-           }
+         
+         PointerType* ty = dyn_cast<PointerType>(globVal->getType());
+         if(!ty){
+           errs() << "WARNINGS: shared object ty is not a pointer type\n";
+           continue;
+         }
+         
+         Type* pointedTy = ty->getPointerElementType();
+         std::string varName = extractVarName(globVal->getName().str());
+         std::string baseName = varName + "_shared";
+        std::string newName = baseName;
+         int counter = 0;
+         while(M.getNamedValue(newName) != nullptr || nameCounts.find(newName) != nameCounts.end()){
+           counter++;
+           newName = baseName + std::to_string(counter);
+         }
+         nameCounts[newName] = 1;
+         GlobalVariable* newGlob = new GlobalVariable(
+             M,
+             pointedTy,
+             false, // isConstant
+             GlobalValue::InternalLinkage,
+             Constant::getNullValue(pointedTy), // initializer
+             newName,
+             nullptr, // insert before
+             GlobalVariable::NotThreadLocal,
+             0 // address space 0
+         );
+         
+         oldGlob2NewGlob[globVal] = newGlob;
+         globalsToDelete.push_back(globVal);
+         errs() << "mergeKernel: Created new global " << newName << " for shared memory " << globVal->getName() << "\n";
+     }
+     
+     // Replace all uses of address space 3 globals
+     for(auto [oldGlob, newGlob] : oldGlob2NewGlob){
+         std::vector<User*> usersToProcess;
+         for(User *U : oldGlob->users()){
+             usersToProcess.push_back(U);
+         }
+         
+         for(User *U : usersToProcess){
+             ConstantExpr *UE = dyn_cast<ConstantExpr>(U);
+             if(!UE) continue;
+             
+             // Check if it's an addrspacecast
+             if(UE->getOpcode() == Instruction::AddrSpaceCast){
+                 addrspacecast2NewGlob[UE] = newGlob;
+                 errs() << "mergeKernel: Found addrspacecast: " << *UE << "\n";
+                 std::vector<User*> castUsers;
+                 for(User *CastU : UE->users()){
+                     castUsers.push_back(CastU);
+                 }
+                 
+                 for(User *CastU : castUsers){
+                     if(GEPOperator *gepOp = dyn_cast<GEPOperator>(CastU)){
+                         errs() << "mergeKernel: Found GEPOperator: " << *gepOp << "\n";
+                         std::vector<Instruction*> gepUsers;
+                         for(User *GepU : gepOp->users()){
+                             if(Instruction *I = dyn_cast<Instruction>(GepU)){
+                                 gepUsers.push_back(I);
+                             }
+                         }
+                         gepOp2Users[gepOp] = gepUsers;
+                     }
+                 }
+             }
          }
      }
-     for(auto [func, sharedGlobs] : func2SharedGlobs){
-       const DataLayout &DL = M.getDataLayout();
-       int i=0;
-       for(auto glob : sharedGlobs){
-          PointerType* ty = dyn_cast<PointerType>(glob->getType());
-          if(!ty){
-            errs() << "WARNINGS: shared object ty is not a pointer type\n";
-            continue;
-          }
-
-          Type* pointedTy = ty->getPointerElementType();
-          auto &entryBB = func->getEntryBlock();
-          auto term = entryBB.getTerminator();
-          AllocaInst *sharedAlloc = new AllocaInst(pointedTy, 0, nullptr, "sharedMem"+std::to_string(i), &(entryBB.front()));
-          ++i;
-          for(auto globInst : glob2Insts[glob]){
-            if(globInst->getParent()->getParent() != func) continue;
-            if(inst2opIt.find(globInst) != inst2opIt.end())
-              *(inst2opIt[globInst]) = sharedAlloc;
-            errs() << "gepinst: " << *globInst << "\n";
-          }
-          for(auto [LI, gepOp] : inst2gepOp){
-            if(LI->getParent()->getParent() != func) continue;
-            std::vector<Value*> idxList(gepOp->idx_begin(), gepOp->idx_end());
-            auto gepInst = GetElementPtrInst::Create(
-                  gepOp->getSourceElementType(),
-                  sharedAlloc,
-                  makeArrayRef(idxList),
-                  "sharedMem.gep" + std::to_string(i),
-                  LI
-                );
-            for (auto OI = LI->op_begin(), OE = LI->op_end(); OI != OE; ++OI){
-              if(*OI == gepOp)
-                *OI = gepInst;
-            }
-
-          }
-
-       }
+     
+     // Replace GEPOperator uses with new GEP instructions using new globals
+     for(auto [gepOp, users] : gepOp2Users){
+         if(users.empty()) continue;
+         
+         GlobalVariable* newGlob = nullptr;
+         if(ConstantExpr *castExpr = dyn_cast<ConstantExpr>(gepOp->getPointerOperand())){
+             if(addrspacecast2NewGlob.find(castExpr) != addrspacecast2NewGlob.end()){
+                 newGlob = addrspacecast2NewGlob[castExpr];
+             }
+         }
+         
+         if(!newGlob) continue;
+         
+         for(Instruction *user : users){
+             std::vector<Value*> idxList(gepOp->idx_begin(), gepOp->idx_end());
+             GetElementPtrInst *newGep = GetElementPtrInst::Create(
+                 gepOp->getSourceElementType(),
+                 newGlob,
+                 makeArrayRef(idxList),
+                 "sharedMem.gep",
+                 user
+             );
+             
+             user->replaceUsesOfWith(gepOp, newGep);
+             errs() << "mergeKernel: Replaced GEPOperator use in " << *user << "\n";
+         }
      }
-     for(auto [func, sharedMemVars] : func2SharedMems){
-       errs() << "mergeKernel: func that contain shared mem objects: " << func->getName() << "\n";
-       for(auto var : sharedMemVars)
-         errs() << "mergeKernel: sharedMemvar: " << *var << "\n";
+     
+     // Replace remaining addrspacecast uses with new globals
+     for(auto [castExpr, newGlob] : addrspacecast2NewGlob){
+         std::vector<User*> castUsers;
+         for(User *CastU : castExpr->users()){
+             castUsers.push_back(CastU);
+         }
+         
+         for(User *CastU : castUsers){
+             if(Instruction *I = dyn_cast<Instruction>(CastU)){
+                 I->replaceUsesOfWith(castExpr, newGlob);
+                 errs() << "mergeKernel: Replaced addrspacecast use in " << *I << "\n";
+             }
+         }
+     }
+     
+     // Clean up - remove original address space 3 globals
+     for(GlobalVariable* oldGlob : globalsToDelete){
+         if(oldGlob->use_empty()){
+             errs() << "mergeKernel: Removing old shared memory global " << oldGlob->getName() << "\n";
+             oldGlob->eraseFromParent();
+         } else {
+             errs() << "mergeKernel: WARNING: Old shared memory global " << oldGlob->getName() << " still has uses\n";
+         }
      }
 
     //Split function at synchronization points
