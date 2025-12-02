@@ -764,6 +764,10 @@ struct MergeKernel : public ModulePass {
             //      }
             //    }
             //}
+            // Replace uses of cudaMalloc return value (error code) with 0 before deleting
+            if(!CI->use_empty()){
+              CI->replaceAllUsesWith(ConstantInt::get(CI->getType(), 0));
+            }
             insts2Remove.push_back(CI);
           }
           else if(calledFunc->getName().contains("cudaMemcpy")){
@@ -794,7 +798,17 @@ struct MergeKernel : public ModulePass {
             assert(devAlloc && originalAlloc && "mergeKernel: didn't find alloca from cudaMemcpy!\n");
             std::map<AllocaInst*, LoadInst>originalAlloc2newLD;
             errs() << "ANDREW: mergeKernel: originalLd " << *originalLd << "\n";
-            auto newLd = new LoadInst(cast<PointerType>(originalAlloc->getType())->getElementType(), originalAlloc, "ldHost", originalLd);
+            // Insert the load in the entry block after all allocas to ensure it dominates all uses
+            BasicBlock &entryBB = F->getEntryBlock();
+            Instruction *insertPt = entryBB.getTerminator();
+            // Find insertion point after all allocas but before terminator
+            for (auto &I : entryBB) {
+                if (!isa<AllocaInst>(&I)) {
+                    insertPt = &I;
+                    break;
+                }
+            }
+            auto newLd = new LoadInst(cast<PointerType>(originalAlloc->getType())->getElementType(), originalAlloc, "ldHost", insertPt);
             Value* cpySize = nullptr;
             errs() << "mergeKernel: found originalAlloc " << *originalAlloc << "\n";
             for(auto user : originalAlloc->users()){
