@@ -774,41 +774,53 @@ struct MergeKernel : public ModulePass {
             ConstantInt* mode = dyn_cast<ConstantInt>(CI->getArgOperand(3));
             Value* originalMem = mode->isOne() ? CI->getArgOperand(1) : CI->getArgOperand(0);
             LoadInst* originalLd = nullptr;
-            AllocaInst* originalAlloc = nullptr;
+            Value* originalAlloc = nullptr;
             if(Instruction* originalBitcast = dyn_cast<BitCastInst>(originalMem)) 
               originalLd = dyn_cast<LoadInst>(originalBitcast->getOperand(0));
             else
               originalLd = dyn_cast<LoadInst>(originalMem);
+            
             if(originalLd)
-              originalAlloc = dyn_cast<AllocaInst>(originalLd->getOperand(0));
+              originalAlloc = originalLd->getOperand(0);
             else
-             originalAlloc = dyn_cast<AllocaInst>(originalMem);
+              originalAlloc = originalMem;
+              
+            if(ConstantExpr *CE = dyn_cast<ConstantExpr>(originalAlloc))
+              if(CE->isCast()) originalAlloc = CE->getOperand(0);
+            if(BitCastInst *BI = dyn_cast<BitCastInst>(originalAlloc))
+              originalAlloc = BI->getOperand(0);
+
+
             Value* devMem = mode->isOne() ? CI->getArgOperand(0) : CI->getArgOperand(1);
             LoadInst* devLd = nullptr;
-            AllocaInst* devAlloc = nullptr;
+            Value* devAlloc = nullptr;
             if(Instruction* devBitcast = dyn_cast<BitCastInst>(devMem)) 
               devLd = dyn_cast<LoadInst>(devBitcast->getOperand(0));
             else
               devLd = dyn_cast<LoadInst>(devMem);
             if(devLd)
-              devAlloc = dyn_cast<AllocaInst>(devLd->getOperand(0));
+              devAlloc = devLd->getOperand(0);
             else
-             devAlloc = dyn_cast<AllocaInst>(devMem);
+              devAlloc = devMem;
+
+            if(ConstantExpr *CE = dyn_cast<ConstantExpr>(devAlloc))
+              if(CE->isCast()) devAlloc = CE->getOperand(0);
+            if(BitCastInst *BI = dyn_cast<BitCastInst>(devAlloc))
+              devAlloc = BI->getOperand(0);
             
-            assert(devAlloc && originalAlloc && "mergeKernel: didn't find alloca from cudaMemcpy!\n");
-            std::map<AllocaInst*, LoadInst>originalAlloc2newLD;
-            errs() << "ANDREW: mergeKernel: originalLd " << *originalLd << "\n";
-            // Insert the load in the entry block after all allocas to ensure it dominates all uses
-            BasicBlock &entryBB = F->getEntryBlock();
-            Instruction *insertPt = entryBB.getTerminator();
-            // Find insertion point after all allocas but before terminator
-            for (auto &I : entryBB) {
-                if (!isa<AllocaInst>(&I)) {
-                    insertPt = &I;
-                    break;
-                }
+            bool validOriginal = isa<AllocaInst>(originalAlloc) || isa<GlobalVariable>(originalAlloc);
+            bool validDev = isa<AllocaInst>(devAlloc) || isa<GlobalVariable>(devAlloc);
+
+            if(!validOriginal || !validDev){
+               errs() << "ANDREW: mergeKernel: invalid memory object for cudaMemcpy replacement logic\n";
+               if(originalAlloc) errs() << "Original: " << *originalAlloc << "\n";
+               if(devAlloc) errs() << "Dev: " << *devAlloc << "\n";
             }
-            auto newLd = new LoadInst(cast<PointerType>(originalAlloc->getType())->getElementType(), originalAlloc, "ldHost", insertPt);
+
+            assert(validDev && validOriginal && "ANDREW: mergeKernel: didn't find alloca or global from cudaMemcpy!\n");
+            
+            errs() << "ANDREW: mergeKernel: originalLd " << *originalLd << "\n";
+            
             Value* cpySize = nullptr;
             errs() << "mergeKernel: found originalAlloc " << *originalAlloc << "\n";
             for(auto user : originalAlloc->users()){
@@ -842,16 +854,20 @@ struct MergeKernel : public ModulePass {
                 }
               }
             }
+            std::vector<User*> devAllocUsers;
             for(auto user : devAlloc->users()){
+                devAllocUsers.push_back(user);
+            }
+            for(auto user : devAllocUsers){
               if(LoadInst *ld = dyn_cast<LoadInst>(user)){
-                for(auto user : ld->users()){
-                  Instruction* UI = dyn_cast<Instruction>(user);
-                  for (auto OI = UI->op_begin(), OE = UI->op_end(); OI != OE; ++OI){
-                    Value *val = *OI;
-                    if(val == ld)
-                      *OI = newLd;
-                  }
-                }
+                 if(ld->getType() == originalAlloc->getType()->getPointerElementType()){
+                     ld->setOperand(0, originalAlloc);
+                 } else {
+                     // If types mismatch (unlikely for matched globals), create a bitcast
+                     // However, for now assuming they match or we insert a cast
+                     auto cast = CastInst::CreatePointerCast(originalAlloc, ld->getOperand(0)->getType(), "castHost", ld);
+                     ld->setOperand(0, cast);
+                 }
               }
             }
 
