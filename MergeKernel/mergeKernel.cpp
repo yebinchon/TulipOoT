@@ -63,6 +63,242 @@ struct MergeKernel : public ModulePass {
     AU.addRequired<DominatorTreeWrapperPass>();
   }
 
+  // Replace inlined CUDA device log function (_ZL3logd) with a simple log() call
+  // CUDA inlines math functions like log() into a complex sequence of blocks with
+  // NVVM intrinsics. This function simplifies the IR by:
+  // 1. Finding ALL _ZL3logd.exit blocks and their corresponding entry blocks
+  // 2. Creating standard library log() calls with the original inputs
+  // 3. Redirecting control flow to bypass each inlined implementation
+  // 4. Deleting the now-unreachable intermediate blocks AFTER all patterns are processed
+  void replaceInlinedLog(Function &F, std::vector<Instruction*> &insts2Remove) {
+    Module *M = F.getParent();
+    LLVMContext &Ctx = M->getContext();
+    
+    // Structure to hold information about each log pattern
+    struct LogPattern {
+      BasicBlock *entryBB;
+      BasicBlock *exitBB;
+      AllocaInst *allocaInst;  // The a.addr.i alloca for this pattern
+      Value *logInput;
+      Instruction *insertPoint;
+      PHINode *resultPhi;
+    };
+    
+    std::vector<LogPattern> patterns;
+    
+    // First, find ALL a.addr.i allocas and their corresponding entry blocks
+    std::map<AllocaInst*, BasicBlock*> allocaToEntryBB;
+    std::map<AllocaInst*, Value*> allocaToLogInput;
+    std::map<AllocaInst*, Instruction*> allocaToInsertPoint;
+    
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        if (StoreInst *SI = dyn_cast<StoreInst>(&I)) {
+          if (AllocaInst *AI = dyn_cast<AllocaInst>(SI->getPointerOperand())) {
+            if (AI->getName().contains("a.addr.i")) {
+              // Check if we already have a log call for this alloca in this block
+              bool hasLogCall = false;
+              for (auto &BI : BB) {
+                if (CallInst *CI = dyn_cast<CallInst>(&BI)) {
+                  if (Function *calledFunc = CI->getCalledFunction()) {
+                    if (calledFunc->getName() == "log") {
+                      hasLogCall = true;
+                      break;
+                    }
+                  }
+                }
+              }
+              
+              if (!hasLogCall && allocaToEntryBB.find(AI) == allocaToEntryBB.end()) {
+                allocaToEntryBB[AI] = &BB;
+                allocaToLogInput[AI] = SI->getValueOperand();
+                allocaToInsertPoint[AI] = SI->getNextNode();
+                errs() << "ANDREW: mergeKernel: found log entry for alloca " << AI->getName() 
+                       << " in block " << BB.getName() << "\n";
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    // Find ALL _ZL3logd.exit blocks
+    std::vector<BasicBlock*> exitBlocks;
+    for (auto &BB : F) {
+      if (BB.getName().contains("_ZL3logd.exit")) {
+        exitBlocks.push_back(&BB);
+        errs() << "ANDREW: mergeKernel: found exit block: " << BB.getName() << "\n";
+      }
+    }
+    
+    if (allocaToEntryBB.empty() || exitBlocks.empty()) {
+      return;  // No log patterns found
+    }
+    
+    // Match entry blocks to exit blocks
+    // For each entry block, find the exit block that is reachable from it
+    for (auto &pair : allocaToEntryBB) {
+      AllocaInst *AI = pair.first;
+      BasicBlock *entryBB = pair.second;
+      
+      // Find the exit block reachable from this entry
+      // The exit block should be a successor (possibly indirect) of the entry
+      BasicBlock *matchedExit = nullptr;
+      for (BasicBlock *exitBB : exitBlocks) {
+        // Check if this exit is reachable from entry
+        std::set<BasicBlock*> visited;
+        std::vector<BasicBlock*> worklist;
+        worklist.push_back(entryBB);
+        bool found = false;
+        
+        while (!worklist.empty() && !found) {
+          BasicBlock *curr = worklist.back();
+          worklist.pop_back();
+          if (visited.count(curr)) continue;
+          visited.insert(curr);
+          
+          // Only match this exit if it's NOT the entry block itself
+          if (curr == exitBB && curr != entryBB) {
+            found = true;
+            matchedExit = exitBB;
+            break;
+          }
+          
+          for (auto *succ : successors(curr)) {
+            // Add successor to worklist for further exploration
+            if (!visited.count(succ)) {
+              worklist.push_back(succ);
+            }
+            // Check if this successor is the exit we're looking for
+            if (succ == exitBB && succ != entryBB) {
+              found = true;
+              matchedExit = exitBB;
+              break;
+            }
+          }
+        }
+        
+        if (found) break;
+      }
+      
+      if (!matchedExit) {
+        // If we couldn't find a matching exit, skip this pattern
+        // This can happen for patterns where the entry is in an exit block of another log
+        errs() << "ANDREW: mergeKernel: could not find matching exit for alloca " 
+               << AI->getName() << ", skipping\n";
+        continue;
+      }
+      
+      // Skip patterns where entry == exit (invalid pattern)
+      if (matchedExit == entryBB) {
+        errs() << "ANDREW: mergeKernel: entry == exit for alloca " 
+               << AI->getName() << ", skipping invalid pattern\n";
+        continue;
+      }
+      
+      // Get the result phi from the exit block (must be double type to match log() return)
+      PHINode *resultPhi = nullptr;
+      Type *doubleTy = Type::getDoubleTy(M->getContext());
+      for (auto &I : *matchedExit) {
+        if (PHINode *phi = dyn_cast<PHINode>(&I)) {
+          // Only use a phi that returns double (matching log's return type)
+          if (phi->getType() == doubleTy) {
+            resultPhi = phi;
+            break;
+          }
+        }
+      }
+      
+      LogPattern pattern;
+      pattern.entryBB = entryBB;
+      pattern.exitBB = matchedExit;
+      pattern.allocaInst = AI;
+      pattern.logInput = allocaToLogInput[AI];
+      pattern.insertPoint = allocaToInsertPoint[AI];
+      pattern.resultPhi = resultPhi;
+      patterns.push_back(pattern);
+      
+      errs() << "ANDREW: mergeKernel: matched pattern - entry: " << entryBB->getName()
+             << ", exit: " << matchedExit->getName() 
+             << ", alloca: " << AI->getName() << "\n";
+    }
+    
+    if (patterns.empty()) {
+      errs() << "ANDREW: mergeKernel: no valid log patterns found\n";
+      return;
+    }
+    
+    errs() << "ANDREW: mergeKernel: found " << patterns.size() << " inlined log pattern(s)\n";
+    
+    // Create the log function type
+    Type *doubleTy = Type::getDoubleTy(Ctx);
+    FunctionType *logFuncTy = FunctionType::get(doubleTy, {doubleTy}, false);
+    FunctionCallee logFunc = M->getOrInsertFunction("log", logFuncTy);
+    
+    // Process each pattern
+    for (auto &pattern : patterns) {
+      errs() << "ANDREW: mergeKernel: processing pattern for alloca " 
+             << pattern.allocaInst->getName() << "\n";
+      errs() << "ANDREW: mergeKernel: log input: " << *pattern.logInput << "\n";
+      
+      // Create the log call
+      CallInst *logCall = CallInst::Create(logFunc, {pattern.logInput}, "log_result", 
+                                           pattern.insertPoint);
+      errs() << "ANDREW: mergeKernel: created log call: " << *logCall << "\n";
+      
+      // Replace uses of the result phi with the log call
+      if (pattern.resultPhi) {
+        pattern.resultPhi->replaceAllUsesWith(logCall);
+        pattern.resultPhi->eraseFromParent();
+        errs() << "ANDREW: mergeKernel: deleted result phi node\n";
+      }
+      
+      // Redirect control flow: entry block should branch directly to exit block
+      Instruction *oldTerm = pattern.entryBB->getTerminator();
+      BranchInst::Create(pattern.exitBB, oldTerm);
+      oldTerm->eraseFromParent();
+      
+      errs() << "ANDREW: mergeKernel: redirected control flow from " 
+             << pattern.entryBB->getName() << " to " << pattern.exitBB->getName() << "\n";
+    }
+    
+    // NOW delete all unreachable blocks (after ALL patterns are processed)
+    std::set<BasicBlock*> reachable;
+    std::vector<BasicBlock*> worklist;
+    worklist.push_back(&F.getEntryBlock());
+    
+    while (!worklist.empty()) {
+      BasicBlock *BB = worklist.back();
+      worklist.pop_back();
+      if (reachable.count(BB)) continue;
+      reachable.insert(BB);
+      for (auto *Succ : successors(BB)) {
+        worklist.push_back(Succ);
+      }
+    }
+    
+    // Collect unreachable blocks
+    std::vector<BasicBlock*> toDelete;
+    for (auto &BB : F) {
+      if (!reachable.count(&BB)) {
+        toDelete.push_back(&BB);
+      }
+    }
+    
+    errs() << "ANDREW: mergeKernel: found " << toDelete.size() << " unreachable blocks to delete\n";
+    
+    // Delete unreachable blocks
+    for (auto *BB : toDelete) {
+      BB->dropAllReferences();
+    }
+    for (auto *BB : toDelete) {
+      BB->eraseFromParent();
+    }
+    
+    errs() << "ANDREW: mergeKernel: replaced " << patterns.size() 
+           << " inlined log(s) with log() calls and cleaned up dead blocks\n";
+  }
+
   void findThreadDim(KernelProfile *kernelProfile, Function &F, LoadInst *DimArg, bool isBlockDim){
     //LoadInst *DimArg = dyn_cast<LoadInst>(CI->getArgOperand(2));
     assert(DimArg && "mergeKernel: DimArg is not a load inst\n");
@@ -201,7 +437,9 @@ struct MergeKernel : public ModulePass {
   void splitFunction(LLVMContext &Context, Function* F, std::set<Instruction*> insts) {
     IRBuilder<> Builder(Context);
     unsigned barrierCount = insts.size();
-    auto orignalName = F->getName();
+    // Convert to std::string and remove null bytes to prevent assertion failures
+    std::string orignalName = F->getName().str();
+    orignalName.erase(std::remove(orignalName.begin(), orignalName.end(), '\0'), orignalName.end());
     F->setName(orignalName+"0");
 
     // Order needs to be later instructions first
@@ -355,6 +593,7 @@ struct MergeKernel : public ModulePass {
   }
 
   bool runOnModule(Module &M) override {
+    std::set<Function*> atomicImplFuncs;
     //transform target
     for (Module::iterator FI = M.begin(), FE = M.end(); FI != FE; ++FI) {
       std::map<CallInst*, KernelProfile*> kernelProfiles;
@@ -366,9 +605,32 @@ struct MergeKernel : public ModulePass {
         F->removeFnAttr("target-cpu");
       BasicBlock *kernelBB = nullptr;
       std::vector<Instruction*> insts2Remove;
+      
+      // Replace inlined log patterns first (before processing intrinsics)
+      replaceInlinedLog(*F, insts2Remove);
+      
       for (inst_iterator I = inst_begin(F), E = inst_end(F); I != E; ++I) {
+        if (AtomicRMWInst *RMW = dyn_cast<AtomicRMWInst>(&*I)) {
+          if (RMW->getOperation() == AtomicRMWInst::Add ||
+              RMW->getOperation() == AtomicRMWInst::FAdd) {
+            LLVMContext &C = RMW->getContext();
+            MDNode *N = MDNode::get(C, MDString::get(C, ""));
+            RMW->setMetadata("tulip.atomic.add", N);
+          }
+        }
         if(CallInst *CI = dyn_cast<CallInst>(&*I)){
           Function* calledFunc = CI->getCalledFunction();
+          if (!calledFunc) continue; // Skip indirect calls and inline assembly
+          if (calledFunc->getName().contains("atomicAdd")) {
+            LLVMContext &C = CI->getContext();
+            MDNode *N = MDNode::get(C, MDString::get(C, ""));
+            CI->setMetadata("tulip.atomic.add", N);
+            atomicImplFuncs.insert(calledFunc);
+            continue;
+          }
+          if (calledFunc->getName().contains("atomicCAS")) {
+            atomicImplFuncs.insert(calledFunc);
+          }
           // Collect sync functions
           if(calledFunc->getName().contains("llvm.nvvm.barrier")){
             syncFuncs.insert(calledFunc);
@@ -423,6 +685,24 @@ struct MergeKernel : public ModulePass {
                   *OI = sqrtCall;
               }
             }
+            insts2Remove.push_back(CI);
+          }
+          // Note: llvm.nvvm.fma.rn.d is part of inlined _ZL3logd
+          // DCE will remove dead fma calls after replaceInlinedLog
+          // Replace nvvm fabs.d with standard fabs (used for max(fabs(t3), fabs(t4)) outside log)
+          else if (calledFunc->getName().contains("llvm.nvvm.fabs.d")){
+            errs() << "mergeKernel: found nvvm fabs.d declaration\n";
+            auto fabsFuncTy = calledFunc->getFunctionType();
+            CallSite CS(CI);
+            SmallVector<Value *, 4> args(CS.arg_begin(), CS.arg_end());
+            auto fabsFunc = F->getParent()->getOrInsertFunction("fabs", fabsFuncTy);
+            auto fabsCall = CallInst::Create(
+                  fabsFunc,
+                  args,
+                  "",
+                  CI
+                );
+            CI->replaceAllUsesWith(fabsCall);
             insts2Remove.push_back(CI);
           }
           else if(calledFunc->getName().contains("_ZN4dim3C2Ejjj")){
@@ -593,6 +873,8 @@ struct MergeKernel : public ModulePass {
                   false
                 );
             std::string newName = demangle(deviceKernel->getName());
+            // Remove null bytes and other invalid characters from demangled name
+            newName.erase(std::remove(newName.begin(), newName.end(), '\0'), newName.end());
             newName = newName.substr(0, newName.find("("));
             kernelProfiles[CI]->newFunc = Function::Create(
                   funcTy,
@@ -702,7 +984,9 @@ struct MergeKernel : public ModulePass {
                 E = inst_end(newFunc); I != E; ++I){
               CallInst *ci = dyn_cast<CallInst>(&*I);
               if(!ci) continue;
-              auto calledFuncName = ci->getCalledFunction()->getName();
+              Function *calledFunc = ci->getCalledFunction();
+              if (!calledFunc) continue; // Skip indirect calls and external functions
+              auto calledFuncName = calledFunc->getName();
 
               std::map<std::string, std::string> nvvmCall2arg {
                 { "llvm.nvvm.read.ptx.sreg.tid.x", "threadIdx.x"},
@@ -819,7 +1103,10 @@ struct MergeKernel : public ModulePass {
 
             assert(validDev && validOriginal && "ANDREW: mergeKernel: didn't find alloca or global from cudaMemcpy!\n");
             
-            errs() << "ANDREW: mergeKernel: originalLd " << *originalLd << "\n";
+            if(originalLd)
+              errs() << "ANDREW: mergeKernel: originalLd " << *originalLd << "\n";
+            else
+              errs() << "ANDREW: mergeKernel: originalLd is NULL, originalMem: " << *originalMem << "\n";
             
             Value* cpySize = nullptr;
             errs() << "mergeKernel: found originalAlloc " << *originalAlloc << "\n";
@@ -860,14 +1147,37 @@ struct MergeKernel : public ModulePass {
             }
             for(auto user : devAllocUsers){
               if(LoadInst *ld = dyn_cast<LoadInst>(user)){
-                 if(ld->getType() == originalAlloc->getType()->getPointerElementType()){
-                     ld->setOperand(0, originalAlloc);
-                 } else {
-                     // If types mismatch (unlikely for matched globals), create a bitcast
-                     // However, for now assuming they match or we insert a cast
-                     auto cast = CastInst::CreatePointerCast(originalAlloc, ld->getOperand(0)->getType(), "castHost", ld);
-                     ld->setOperand(0, cast);
-                 }
+                // Check if originalAlloc points to an array type (static array)
+                Type* originalPointeeType = originalAlloc->getType()->getPointerElementType();
+                
+                if(ArrayType *arrTy = dyn_cast<ArrayType>(originalPointeeType)){
+                  // Static array: Create GEP to get pointer to first element
+                  // Array address IS the pointer, so we don't load - we GEP to element 0
+                  Type* i64Ty = Type::getInt64Ty(ld->getContext());
+                  std::vector<Value*> idxs = {
+                    ConstantInt::get(i64Ty, 0),
+                    ConstantInt::get(i64Ty, 0)
+                  };
+                  GetElementPtrInst* gep = GetElementPtrInst::Create(
+                    originalPointeeType,
+                    originalAlloc,
+                    idxs,
+                    "staticArrayPtr",
+                    ld
+                  );
+                  errs() << "mergeKernel: replacing load with GEP for static array: " << *gep << "\n";
+                  // Replace all uses of the load with the GEP
+                  ld->replaceAllUsesWith(gep);
+                  ld->eraseFromParent();
+                } else {
+                  // Pointer variable: Use existing logic
+                  if(ld->getType() == originalPointeeType){
+                    ld->setOperand(0, originalAlloc);
+                  } else {
+                    auto cast = CastInst::CreatePointerCast(originalAlloc, ld->getOperand(0)->getType(), "castHost", ld);
+                    ld->setOperand(0, cast);
+                  }
+                }
               }
             }
 
@@ -1180,6 +1490,25 @@ struct MergeKernel : public ModulePass {
       f->eraseFromParent();
     }
 
+    // Remove CUDA-side atomic helper implementations from the module.
+    // Atomic call-sites are lowered in C backend, so helper bodies should
+    // not appear in emitted C.
+    for (Module::iterator FI = M.begin(), FE = M.end(); FI != FE; ++FI) {
+      Function *F = &*FI;
+      if (F->isDeclaration())
+        continue;
+      if (!F->getName().contains("atomicAdd") &&
+          !F->getName().contains("atomicCAS"))
+        continue;
+      atomicImplFuncs.insert(F);
+    }
+    for (auto *F : atomicImplFuncs) {
+      if (!F || F->isDeclaration())
+        continue;
+      F->deleteBody();
+      F->setLinkage(GlobalValue::ExternalLinkage);
+    }
+
 
     //process shared variables - lift to global variables in address space 0
      std::map<GlobalVariable*, GlobalVariable*> oldGlob2NewGlob; // Map from addrspace(3) to addrspace(0)
@@ -1216,8 +1545,9 @@ struct MergeKernel : public ModulePass {
      for (Module::global_iterator I = M.global_begin(), E = M.global_end();
            I != E; ++I) {
          GlobalVariable* globVal = &*I;
-         if(!globVal->hasInitializer()) continue;
-         if(globVal->getAddressSpace() != 3) continue;
+          // Check for address space 3 (shared memory) - handle both initialized and external globals
+          // External shared memory (extern __shared__) won't have an initializer but still needs processing
+          if(globVal->getAddressSpace() != 3) continue;
          
          PointerType* ty = dyn_cast<PointerType>(globVal->getType());
          if(!ty){
@@ -1226,6 +1556,17 @@ struct MergeKernel : public ModulePass {
          }
          
          Type* pointedTy = ty->getPointerElementType();
+          
+          // Handle extern shared memory which is declared as [0 x T]
+          // We need to create a properly sized array for CPU execution
+          if(ArrayType* arrTy = dyn_cast<ArrayType>(pointedTy)) {
+              if(arrTy->getNumElements() == 0) {
+                  // Create a reasonably sized array (1024 elements for max threads per block)
+                  Type* elemTy = arrTy->getElementType();
+                  pointedTy = ArrayType::get(elemTy, 1024);
+                  errs() << "mergeKernel: Replacing zero-length array with [1024 x " << *elemTy << "]\n";
+              }
+          }
          std::string varName = extractVarName(globVal->getName().str());
          std::string baseName = varName + "_shared";
         std::string newName = baseName;
@@ -1303,8 +1644,10 @@ struct MergeKernel : public ModulePass {
          
          for(Instruction *user : users){
              std::vector<Value*> idxList(gepOp->idx_begin(), gepOp->idx_end());
+             // Use the new global's element type, not the old gepOp's type
+             Type* gepElemType = newGlob->getValueType();
              GetElementPtrInst *newGep = GetElementPtrInst::Create(
-                 gepOp->getSourceElementType(),
+                 gepElemType,
                  newGlob,
                  makeArrayRef(idxList),
                  "sharedMem.gep",
