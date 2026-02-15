@@ -1069,10 +1069,37 @@ struct MergeKernel : public ModulePass {
             else
               originalAlloc = originalMem;
               
-            if(ConstantExpr *CE = dyn_cast<ConstantExpr>(originalAlloc))
-              if(CE->isCast()) originalAlloc = CE->getOperand(0);
-            if(BitCastInst *BI = dyn_cast<BitCastInst>(originalAlloc))
-              originalAlloc = BI->getOperand(0);
+            auto peelToBaseObject = [](Value *V) -> Value * {
+              while (V) {
+                if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+                  if (CE->isCast() || CE->getOpcode() == Instruction::GetElementPtr) {
+                    V = CE->getOperand(0);
+                    continue;
+                  }
+                }
+
+                if (auto *BC = dyn_cast<BitCastInst>(V)) {
+                  V = BC->getOperand(0);
+                  continue;
+                }
+
+                if (auto *ASC = dyn_cast<AddrSpaceCastInst>(V)) {
+                  V = ASC->getOperand(0);
+                  continue;
+                }
+
+                if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
+                  V = GEP->getPointerOperand();
+                  continue;
+                }
+
+                break;
+              }
+
+              return V;
+            };
+
+            originalAlloc = peelToBaseObject(originalAlloc);
 
 
             Value* devMem = mode->isOne() ? CI->getArgOperand(0) : CI->getArgOperand(1);
@@ -1087,10 +1114,7 @@ struct MergeKernel : public ModulePass {
             else
               devAlloc = devMem;
 
-            if(ConstantExpr *CE = dyn_cast<ConstantExpr>(devAlloc))
-              if(CE->isCast()) devAlloc = CE->getOperand(0);
-            if(BitCastInst *BI = dyn_cast<BitCastInst>(devAlloc))
-              devAlloc = BI->getOperand(0);
+            devAlloc = peelToBaseObject(devAlloc);
             
             bool validOriginal = isa<AllocaInst>(originalAlloc) || isa<GlobalVariable>(originalAlloc);
             bool validDev = isa<AllocaInst>(devAlloc) || isa<GlobalVariable>(devAlloc);
@@ -1365,17 +1389,28 @@ struct MergeKernel : public ModulePass {
               indvar->addIncoming(ConstantInt::get(phiTy,0), nextHeader);
             }
 
+            bool mayFissionKernel = false;
+            if (kernelProfile->newFunc &&
+                syncInsts.find(kernelProfile->newFunc) != syncInsts.end() &&
+                !syncInsts[kernelProfile->newFunc].empty()) {
+              mayFissionKernel = true;
+            }
             if(kernelProfile->dim2classify[header2itNum[header]] == 1 ||
                 kernelProfile->dim2classify[header2itNum[header]] == 2){
               LLVMContext& C = term->getContext();
               MDNode* N = MDNode::get(C, MDString::get(C, ""));
               if(kernelProfile->dim2classify[header2itNum[header]] == 1){
-                if(kernelProfile->gridLoopCnt > 1) term->setMetadata("tulip.doall.loop.grid.collapse", N);
-                else term->setMetadata("tulip.doall.loop.grid", N);
+                // Always keep grid-level parallelism so we still emit a pragma.
+                // Collapse happens only when both grid and block are tagged.
+                term->setMetadata("tulip.doall.loop.grid", N);
               }
               if(kernelProfile->dim2classify[header2itNum[header]] == 2){
-                if(kernelProfile->blockLoopCnt > 1) term->setMetadata("tulip.doall.loop.block.collapse", N);
-                else term->setMetadata("tulip.doall.loop.block", N);
+                // If kernel is likely fissioned, avoid block tag so codegen
+                // cannot form collapse(2) on a non-perfect nest.
+                if (!mayFissionKernel)
+                  term->setMetadata("tulip.doall.loop.block", N);
+                else
+                  errs() << "ANDREW: skip block doall metadata for fission-prone kernel to avoid invalid collapse\n";
               }
               errs() << "mergeKernel: create metadata" << *term << "\n";
             }
@@ -1510,7 +1545,7 @@ struct MergeKernel : public ModulePass {
     }
 
 
-    //process shared variables - lift to global variables in address space 0
+    //process shared variables - lift to thread-local globals in address space 0
      std::map<GlobalVariable*, GlobalVariable*> oldGlob2NewGlob; // Map from addrspace(3) to addrspace(0)
      std::map<ConstantExpr*, GlobalVariable*> addrspacecast2NewGlob; // Map from addrspacecast to new global
      std::map<GEPOperator*, std::vector<Instruction*>> gepOp2Users; // Map GEPOperator to instructions using it
@@ -1584,13 +1619,15 @@ struct MergeKernel : public ModulePass {
              Constant::getNullValue(pointedTy), // initializer
              newName,
              nullptr, // insert before
-             GlobalVariable::NotThreadLocal,
+            GlobalVariable::GeneralDynamicTLSModel,
              0 // address space 0
          );
          
-         oldGlob2NewGlob[globVal] = newGlob;
-         globalsToDelete.push_back(globVal);
-         errs() << "mergeKernel: Created new global " << newName << " for shared memory " << globVal->getName() << "\n";
+        oldGlob2NewGlob[globVal] = newGlob;
+        globalsToDelete.push_back(globVal);
+        errs() << "mergeKernel: Created new global " << newName << " for shared memory " << globVal->getName() << "\n";
+        errs() << "ANDREW: shared-lowering created TLS global " << newGlob->getName()
+               << " (old=" << globVal->getName() << ", addrspace3->0)\n";
      }
      
      // Replace all uses of address space 3 globals
@@ -1654,8 +1691,9 @@ struct MergeKernel : public ModulePass {
                  user
              );
              
-             user->replaceUsesOfWith(gepOp, newGep);
-             errs() << "mergeKernel: Replaced GEPOperator use in " << *user << "\n";
+            user->replaceUsesOfWith(gepOp, newGep);
+            errs() << "mergeKernel: Replaced GEPOperator use in " << *user << "\n";
+            errs() << "ANDREW: shared-lowering rewired GEP user to " << newGlob->getName() << "\n";
          }
      }
      
@@ -1668,8 +1706,9 @@ struct MergeKernel : public ModulePass {
          
          for(User *CastU : castUsers){
              if(Instruction *I = dyn_cast<Instruction>(CastU)){
-                 I->replaceUsesOfWith(castExpr, newGlob);
-                 errs() << "mergeKernel: Replaced addrspacecast use in " << *I << "\n";
+                I->replaceUsesOfWith(castExpr, newGlob);
+                errs() << "mergeKernel: Replaced addrspacecast use in " << *I << "\n";
+                errs() << "ANDREW: shared-lowering rewired addrspacecast to " << newGlob->getName() << "\n";
              }
          }
      }
@@ -1677,10 +1716,13 @@ struct MergeKernel : public ModulePass {
      // Clean up - remove original address space 3 globals
      for(GlobalVariable* oldGlob : globalsToDelete){
          if(oldGlob->use_empty()){
-             errs() << "mergeKernel: Removing old shared memory global " << oldGlob->getName() << "\n";
+            errs() << "mergeKernel: Removing old shared memory global " << oldGlob->getName() << "\n";
+            errs() << "ANDREW: shared-lowering removed old addrspace(3) global " << oldGlob->getName() << "\n";
              oldGlob->eraseFromParent();
          } else {
              errs() << "mergeKernel: WARNING: Old shared memory global " << oldGlob->getName() << " still has uses\n";
+            errs() << "ANDREW: shared-lowering old global still live " << oldGlob->getName()
+                   << ", remaining uses=" << oldGlob->getNumUses() << "\n";
          }
      }
 
