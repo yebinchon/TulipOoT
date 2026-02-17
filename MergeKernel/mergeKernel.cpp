@@ -839,6 +839,19 @@ struct MergeKernel : public ModulePass {
             LLVMContext &C = RMW->getContext();
             MDNode *N = MDNode::get(C, MDString::get(C, ""));
             RMW->setMetadata("tulip.atomic.add", N);
+            // When lowering atomicAdd(..., +/-1) where the old value is
+            // consumed, request an unambiguous OpenMP post-inc/dec capture.
+            if (!RMW->user_empty() && !RMW->getType()->isVoidTy()) {
+              if (ConstantInt *CI = dyn_cast<ConstantInt>(RMW->getValOperand())) {
+                if (CI->isMinusOne()) {
+                  MDNode *PostDec = MDNode::get(C, MDString::get(C, ""));
+                  RMW->setMetadata("tulip.atomic.capture.postdec", PostDec);
+                } else if (CI->isOne()) {
+                  MDNode *PostInc = MDNode::get(C, MDString::get(C, ""));
+                  RMW->setMetadata("tulip.atomic.capture.postinc", PostInc);
+                }
+              }
+            }
           }
         }
         if(CallInst *CI = dyn_cast<CallInst>(&*I)){
@@ -855,6 +868,19 @@ struct MergeKernel : public ModulePass {
             LLVMContext &C = CI->getContext();
             MDNode *N = MDNode::get(C, MDString::get(C, ""));
             CI->setMetadata("tulip.atomic.add", N);
+            // Same marker for call-based atomicAdd lowering.
+            if (!CI->user_empty() && !CI->getType()->isVoidTy() &&
+                CI->arg_size() >= 2) {
+              if (ConstantInt *Arg1 = dyn_cast<ConstantInt>(CI->getArgOperand(1))) {
+                if (Arg1->isMinusOne()) {
+                  MDNode *PostDec = MDNode::get(C, MDString::get(C, ""));
+                  CI->setMetadata("tulip.atomic.capture.postdec", PostDec);
+                } else if (Arg1->isOne()) {
+                  MDNode *PostInc = MDNode::get(C, MDString::get(C, ""));
+                  CI->setMetadata("tulip.atomic.capture.postinc", PostInc);
+                }
+              }
+            }
             atomicImplFuncs.insert(calledFunc);
             continue;
           }
@@ -1431,18 +1457,21 @@ struct MergeKernel : public ModulePass {
                 }
               }
             }
-            std::vector<User*> devAllocUsers;
-            for(auto user : devAlloc->users()){
+            // For array/pointer-backed host mappings, rewrite loads of the
+            // corresponding device pointer:
+            //  - static arrays => GEP to first element
+            //  - pointer-backed globals/allocas (CG-style) => load from host ptr slot
+            // Keep scalar/global mappings (e.g. passed_verification in IS) untouched
+            // to avoid castHost pollution.
+            Type* originalPointeeType = originalAlloc->getType()->getPointerElementType();
+            if (ArrayType *arrTy = dyn_cast<ArrayType>(originalPointeeType)) {
+              (void)arrTy;
+              std::vector<User*> devAllocUsers;
+              for (auto user : devAlloc->users())
                 devAllocUsers.push_back(user);
-            }
-            for(auto user : devAllocUsers){
-              if(LoadInst *ld = dyn_cast<LoadInst>(user)){
-                // Check if originalAlloc points to an array type (static array)
-                Type* originalPointeeType = originalAlloc->getType()->getPointerElementType();
-                
-                if(ArrayType *arrTy = dyn_cast<ArrayType>(originalPointeeType)){
-                  // Static array: Create GEP to get pointer to first element
-                  // Array address IS the pointer, so we don't load - we GEP to element 0
+
+              for (auto user : devAllocUsers) {
+                if (LoadInst *ld = dyn_cast<LoadInst>(user)) {
                   Type* i64Ty = Type::getInt64Ty(ld->getContext());
                   std::vector<Value*> idxs = {
                     ConstantInt::get(i64Ty, 0),
@@ -1456,19 +1485,29 @@ struct MergeKernel : public ModulePass {
                     ld
                   );
                   errs() << "mergeKernel: replacing load with GEP for static array: " << *gep << "\n";
-                  // Replace all uses of the load with the GEP
                   ld->replaceAllUsesWith(gep);
                   ld->eraseFromParent();
-                } else {
-                  // Pointer variable: Use existing logic
-                  if(ld->getType() == originalPointeeType){
+                }
+              }
+            } else if (originalPointeeType->isPointerTy()) {
+              std::vector<User*> devAllocUsers;
+              for (auto user : devAlloc->users())
+                devAllocUsers.push_back(user);
+
+              for (auto user : devAllocUsers) {
+                if (LoadInst *ld = dyn_cast<LoadInst>(user)) {
+                  if (ld->getType() == originalPointeeType) {
                     ld->setOperand(0, originalAlloc);
                   } else {
-                    auto cast = CastInst::CreatePointerCast(originalAlloc, ld->getOperand(0)->getType(), "castHost", ld);
+                    auto cast = CastInst::CreatePointerCast(
+                        originalAlloc, ld->getOperand(0)->getType(), "castHost", ld);
                     ld->setOperand(0, cast);
                   }
                 }
               }
+            } else if (devLd) {
+              errs() << "mergeKernel: skipping scalar cudaMemcpy load rewrite: "
+                     << *devLd << "\n";
             }
 
 
