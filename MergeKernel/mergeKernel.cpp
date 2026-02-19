@@ -23,6 +23,7 @@
 #include <stack>
 #include <map>
 #include <string>
+#include <algorithm>
 #include "IDMap.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -553,34 +554,31 @@ struct MergeKernel : public ModulePass {
       if(!called->getName().contains("_ZN4dim3C2Ejjj")) continue;
       if(CI->getArgOperand(0) != AggAlloca) continue;
 
+      bool classifiedPrimaryDim = false;
       for(int i=1; i<=3; ++i){
         Value *dim = CI->getArgOperand(i);
-        //if(ConstantInt *dimConst = dyn_cast<ConstantInt>(dim))
-        //  if(dimConst->getZExtValue() == 1){
-        //    continue;
-        //  }
+        bool isOne = false;
+        if(ConstantInt *constInt = dyn_cast<ConstantInt>(dim))
+          if(constInt->getSExtValue() == 1)
+            isOne = true;
         kernelProfile->loopDims.push_back(dim);
         if(isBlockDim){
-          bool isOne = false;
-          if(ConstantInt *constInt = dyn_cast<ConstantInt>(dim))
-            if(constInt->getSExtValue() == 1)
-              isOne = true;
           if(!isOne) kernelProfile->blockLoopCnt ++;
-          if(i==1)
+          if(!isOne && !classifiedPrimaryDim){
             kernelProfile->dim2classify[dim] = 2;
-          else
+            classifiedPrimaryDim = true;
+          } else {
             kernelProfile->dim2classify[dim] = 0;
+          }
         }
         else{
-          bool isOne = false;
-          if(ConstantInt *constInt = dyn_cast<ConstantInt>(dim))
-            if(constInt->getSExtValue() == 1)
-              isOne = true;
           if(!isOne) kernelProfile->gridLoopCnt ++;
-          if(i==1)
+          if(!isOne && !classifiedPrimaryDim){
             kernelProfile->dim2classify[dim] = 1;
-          else
+            classifiedPrimaryDim = true;
+          } else {
             kernelProfile->dim2classify[dim] = 0;
+          }
         }
 
         errs() << "mergeKernel: Dim " << i << " : " << *dim <<"\n";
@@ -621,33 +619,31 @@ struct MergeKernel : public ModulePass {
         if(!called) continue;
         if(!called->getName().contains("_ZN4dim3C2Ejjj")) continue;
         if(CI->getArgOperand(0) != DimAlloca) continue;
+        bool classifiedPrimaryDim = false;
         for(int i=1; i<=3; ++i){
           Value *dim = CI->getArgOperand(i);
-          //if(ConstantInt *dimConst = dyn_cast<ConstantInt>(dim))
-          //  if(dimConst->getZExtValue() == 1)
-          //    continue;
+          bool isOne = false;
+          if(ConstantInt *constInt = dyn_cast<ConstantInt>(dim))
+            if(constInt->getSExtValue() == 1)
+              isOne = true;
           kernelProfile->loopDims.push_back(dim);
           if(isBlockDim){
-            bool isOne = false;
-            if(ConstantInt *constInt = dyn_cast<ConstantInt>(dim))
-              if(constInt->getSExtValue() == 1)
-                isOne = true;
             if(!isOne) kernelProfile->blockLoopCnt ++;
-            if(i==1)
+            if(!isOne && !classifiedPrimaryDim){
               kernelProfile->dim2classify[dim] = 2;
-            else
+              classifiedPrimaryDim = true;
+            } else {
               kernelProfile->dim2classify[dim] = 0;
+            }
           }
           else{
-            bool isOne = false;
-            if(ConstantInt *constInt = dyn_cast<ConstantInt>(dim))
-              if(constInt->getSExtValue() == 1)
-                isOne = true;
             if(!isOne) kernelProfile->gridLoopCnt ++;
-            if(i==1)
+            if(!isOne && !classifiedPrimaryDim){
               kernelProfile->dim2classify[dim] = 1;
-            else
+              classifiedPrimaryDim = true;
+            } else {
               kernelProfile->dim2classify[dim] = 0;
+            }
           }
         }
         foundDim = true;
@@ -816,6 +812,87 @@ struct MergeKernel : public ModulePass {
 
   bool runOnModule(Module &M) override {
     std::set<Function*> atomicImplFuncs;
+    // Demangle mangled global variable names so CBE emits readable symbols
+    // (e.g. _ZL11grid_points -> grid_points).
+    auto sanitizeIdentifier = [](const std::string &name) -> std::string {
+      std::string out;
+      out.reserve(name.size());
+      for (char ch : name) {
+        bool isAlphaNumUnderscore =
+            ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+             (ch >= '0' && ch <= '9') || ch == '_');
+        out.push_back(isAlphaNumUnderscore ? ch : '_');
+      }
+      if (out.empty())
+        return out;
+      if (out[0] >= '0' && out[0] <= '9')
+        out = "g_" + out;
+      return out;
+    };
+
+    errs() << "mergeKernel: starting global demangle pass\n";
+    std::set<std::string> usedGlobalNames;
+    unsigned globalsVisited = 0;
+    unsigned globalsRenamed = 0;
+    for (auto &GV : M.globals())
+      usedGlobalNames.insert(GV.getName().str());
+
+    for (auto &GV : M.globals()) {
+      ++globalsVisited;
+      StringRef oldNameRef = GV.getName();
+      // Keep frontend-generated C string constants stable.
+      if (oldNameRef.startswith(".str")) {
+        errs() << "mergeKernel: demangle skip (string const): " << oldNameRef << "\n";
+        continue;
+      }
+      if (!oldNameRef.startswith("_Z")) {
+        errs() << "mergeKernel: demangle skip (not mangled): " << oldNameRef << "\n";
+        continue;
+      }
+
+      errs() << "mergeKernel: demangle candidate: " << oldNameRef << "\n";
+
+      std::string demangled = demangle(oldNameRef.str());
+      if (demangled.empty() || demangled == oldNameRef.str()) {
+        errs() << "mergeKernel: demangle failed/unchanged: " << oldNameRef << "\n";
+        continue;
+      }
+
+      size_t parenPos = demangled.find('(');
+      if (parenPos != std::string::npos)
+        demangled = demangled.substr(0, parenPos);
+      size_t nsPos = demangled.rfind("::");
+      if (nsPos != std::string::npos && nsPos + 2 < demangled.size())
+        demangled = demangled.substr(nsPos + 2);
+
+      std::string baseName = sanitizeIdentifier(demangled);
+      if (baseName.empty() || baseName == oldNameRef.str()) {
+        errs() << "mergeKernel: demangle skip (invalid/same sanitized): " << oldNameRef
+               << " -> " << baseName << "\n";
+        continue;
+      }
+
+      std::string candidate = baseName;
+      int suffix = 0;
+      while ((M.getNamedValue(candidate) != nullptr &&
+              M.getNamedValue(candidate) != &GV) ||
+             usedGlobalNames.count(candidate) != 0) {
+        errs() << "mergeKernel: demangle collision for " << oldNameRef
+               << " at candidate " << candidate << ", retrying\n";
+        candidate = baseName + "_" + std::to_string(++suffix);
+      }
+
+      if (candidate != oldNameRef.str()) {
+        errs() << "mergeKernel: demangled global " << oldNameRef
+               << " -> " << candidate << "\n";
+        GV.setName(candidate);
+        ++globalsRenamed;
+      }
+      usedGlobalNames.insert(candidate);
+    }
+    errs() << "mergeKernel: global demangle pass done, visited=" << globalsVisited
+           << ", renamed=" << globalsRenamed << "\n";
+
     //transform target
     for (Module::iterator FI = M.begin(), FE = M.end(); FI != FE; ++FI) {
       std::map<CallInst*, KernelProfile*> kernelProfiles;
@@ -1332,6 +1409,251 @@ struct MergeKernel : public ModulePass {
                      << *CI << "\n";
             }
           }
+          else if(calledFunc->getName().contains("cudaMemcpyToSymbol")){
+            // Lower cudaMemcpyToSymbol(symbol, src, count[, offset[, kind]])
+            // to a plain memcpy into the target global/symbol on host.
+            if (CI->arg_size() < 3) {
+              errs() << "mergeKernel: WARN: unexpected cudaMemcpyToSymbol signature, skipping transform: "
+                     << *CI << "\n";
+              continue;
+            }
+
+            LLVMContext &C = CI->getContext();
+            Type *i8Ty = Type::getInt8Ty(C);
+            Type *i64Ty = Type::getInt64Ty(C);
+
+            Value *dstSymbol = CI->getArgOperand(0);
+            Value *srcPtr = CI->getArgOperand(1);
+            Value *cpySize = CI->getArgOperand(2);
+            Value *offset = (CI->arg_size() >= 4)
+                                ? CI->getArgOperand(3)
+                                : ConstantInt::get(i64Ty, 0);
+
+            // Only support host->device/host->symbol style lowering here.
+            // If kind is present and not constant(1), keep conservative behavior.
+            if (CI->arg_size() >= 5) {
+              if (ConstantInt *kind = dyn_cast<ConstantInt>(CI->getArgOperand(4))) {
+                if (!kind->isOne()) {
+                  errs() << "mergeKernel: WARN: cudaMemcpyToSymbol kind != cudaMemcpyHostToDevice, skipping: "
+                         << *CI << "\n";
+                  continue;
+                }
+              } else {
+                errs() << "mergeKernel: WARN: non-constant cudaMemcpyToSymbol kind, skipping: "
+                       << *CI << "\n";
+                continue;
+              }
+            }
+
+            auto peelToBaseObject = [](Value *V) -> Value * {
+              while (V) {
+                if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+                  if (CE->isCast() || CE->getOpcode() == Instruction::GetElementPtr) {
+                    V = CE->getOperand(0);
+                    continue;
+                  }
+                }
+                if (auto *BC = dyn_cast<BitCastInst>(V)) {
+                  V = BC->getOperand(0);
+                  continue;
+                }
+                if (auto *ASC = dyn_cast<AddrSpaceCastInst>(V)) {
+                  V = ASC->getOperand(0);
+                  continue;
+                }
+                if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
+                  V = GEP->getPointerOperand();
+                  continue;
+                }
+                break;
+              }
+              return V;
+            };
+
+            auto resolveSymbolShadow = [&](Value *V) -> Value * {
+              Value *base = peelToBaseObject(V);
+              GlobalVariable *GV = dyn_cast<GlobalVariable>(base);
+              if (!GV)
+                return V;
+
+              StringRef name = GV->getName();
+              size_t dotPos = name.rfind('.');
+              if (dotPos == StringRef::npos || dotPos == 0 || dotPos + 1 >= name.size())
+                return V;
+
+              StringRef suffix = name.substr(dotPos + 1);
+              if (!std::all_of(suffix.begin(), suffix.end(), [](char ch) {
+                    return ch >= '0' && ch <= '9';
+                  }))
+                return V;
+
+              StringRef baseName = name.substr(0, dotPos);
+              GlobalVariable *realSymbol = F->getParent()->getNamedGlobal(baseName);
+              if (!realSymbol)
+                return V;
+              if (realSymbol->getValueType() != GV->getValueType())
+                return V;
+
+              errs() << "mergeKernel: resolved cudaMemcpyToSymbol shadow global "
+                     << GV->getName() << " -> " << realSymbol->getName() << "\n";
+              return realSymbol;
+            };
+
+            dstSymbol = resolveSymbolShadow(dstSymbol);
+
+            auto *dstPtrTy = dyn_cast<PointerType>(dstSymbol->getType());
+            if (!dstPtrTy) {
+              errs() << "mergeKernel: WARN: cudaMemcpyToSymbol destination is not a pointer, skipping: "
+                     << *CI << "\n";
+              continue;
+            }
+            auto *srcPtrTy = dyn_cast<PointerType>(srcPtr->getType());
+            if (!srcPtrTy) {
+              errs() << "mergeKernel: WARN: cudaMemcpyToSymbol source is not a pointer, skipping: "
+                     << *CI << "\n";
+              continue;
+            }
+
+            Value *offset64 = offset;
+            if (offset64->getType() != i64Ty) {
+              if (offset64->getType()->isIntegerTy())
+                offset64 = CastInst::CreateIntegerCast(offset64, i64Ty, false, "tulip.sym.off.cast", CI);
+              else
+                offset64 = ConstantInt::get(i64Ty, 0);
+            }
+
+            Value *size64 = cpySize;
+            if (size64->getType() != i64Ty) {
+              if (size64->getType()->isIntegerTy())
+                size64 = CastInst::CreateIntegerCast(size64, i64Ty, false, "tulip.sym.size.cast", CI);
+              else
+                size64 = ConstantInt::get(i64Ty, 0);
+            }
+
+            // Only lower full-symbol writes (offset 0, size == sizeof(symbol)).
+            ConstantInt *offImm = dyn_cast<ConstantInt>(offset64);
+            ConstantInt *sizeImm = dyn_cast<ConstantInt>(size64);
+            if (!offImm || !offImm->isZero() || !sizeImm) {
+              errs() << "mergeKernel: WARN: unsupported non-full cudaMemcpyToSymbol, keeping call: "
+                     << *CI << "\n";
+              continue;
+            }
+            Type *dstElemTy = dstPtrTy->getPointerElementType();
+            const DataLayout &DL = F->getParent()->getDataLayout();
+            uint64_t dstElemSize = DL.getTypeStoreSize(dstElemTy);
+            if (sizeImm->getZExtValue() != dstElemSize) {
+              errs() << "mergeKernel: WARN: cudaMemcpyToSymbol size does not match symbol size, keeping call: "
+                     << *CI << "\n";
+              continue;
+            }
+            if (dstElemTy->isAggregateType()) {
+              Type *dstBytePtrTy = Type::getInt8PtrTy(C, dstPtrTy->getAddressSpace());
+              Type *srcBytePtrTy = Type::getInt8PtrTy(C, srcPtrTy->getAddressSpace());
+              Value *dstBytes = dstSymbol;
+              Value *srcBytes = srcPtr;
+              if (dstBytes->getType() != dstBytePtrTy)
+                dstBytes = CastInst::CreatePointerCast(
+                    dstBytes, dstBytePtrTy, "tulip.sym.dst.byte.cast", CI);
+              if (srcBytes->getType() != srcBytePtrTy)
+                srcBytes = CastInst::CreatePointerCast(
+                    srcBytes, srcBytePtrTy, "tulip.sym.src.byte.cast", CI);
+
+              uint64_t copyBytes = sizeImm->getZExtValue();
+              for (uint64_t b = 0; b < copyBytes; ++b) {
+                Value *idx = ConstantInt::get(i64Ty, b);
+                Value *dstByte = GetElementPtrInst::Create(
+                    i8Ty, dstBytes, {idx}, "tulip.sym.dst.byte", CI);
+                Value *srcByte = GetElementPtrInst::Create(
+                    i8Ty, srcBytes, {idx}, "tulip.sym.src.byte", CI);
+                auto *loadedByte = new LoadInst(i8Ty, srcByte, "tulip.sym.byte.ld", CI);
+                new StoreInst(loadedByte, dstByte, CI);
+              }
+            } else {
+              Type *srcTypedPtrTy =
+                  PointerType::get(dstElemTy, srcPtrTy->getAddressSpace());
+              Value *srcTyped = srcPtr;
+              if (srcTyped->getType() != srcTypedPtrTy)
+                srcTyped = CastInst::CreatePointerCast(
+                    srcTyped, srcTypedPtrTy, "tulip.sym.src.typed.cast", CI);
+              auto *typedLoad = new LoadInst(
+                  dstElemTy, srcTyped, "tulip.sym.typed.ld", CI);
+              new StoreInst(typedLoad, dstSymbol, CI);
+            }
+
+            funcs2delete.insert(calledFunc);
+            if (!CI->use_empty())
+              CI->replaceAllUsesWith(ConstantInt::get(CI->getType(), 0));
+            insts2Remove.push_back(CI);
+          }
+          else if(calledFunc->getName().contains("cudaMemset")){
+            // Lower cudaMemset(dst, value, size) to llvm.memset on host.
+            // IR commonly appears as:
+            //   call i32 @cudaMemset(i8* (bitcast/load ...), i32 val, i64 size)
+            // We must memset the pointed-to allocation, not the pointer slot.
+            if (CI->arg_size() < 3) {
+              errs() << "mergeKernel: WARN: unexpected cudaMemset signature, skipping transform: "
+                     << *CI << "\n";
+              continue;
+            }
+
+            LLVMContext &C = CI->getContext();
+            Type *i8Ty = Type::getInt8Ty(C);
+            Type *i8PtrTy = Type::getInt8PtrTy(C);
+            Type *i64Ty = Type::getInt64Ty(C);
+
+            Value *dstPtr = CI->getArgOperand(0);
+            Value *fillVal = CI->getArgOperand(1);
+            Value *setSize = CI->getArgOperand(2);
+
+            // Prefer the loaded pointer if dst is a cast of a load:
+            //   bitcast (load T*, T** @slot) to i8*
+            if (auto *BC = dyn_cast<BitCastInst>(dstPtr)) {
+              if (auto *LD = dyn_cast<LoadInst>(BC->getOperand(0)))
+                dstPtr = LD;
+              else
+                dstPtr = BC->getOperand(0);
+            } else if (auto *CE = dyn_cast<ConstantExpr>(dstPtr)) {
+              if (CE->isCast() || CE->getOpcode() == Instruction::GetElementPtr)
+                dstPtr = CE->getOperand(0);
+            }
+
+            if (dstPtr->getType() != i8PtrTy)
+              dstPtr = CastInst::CreatePointerCast(dstPtr, i8PtrTy, "tulip.memset.dst.cast", CI);
+
+            Value *fillI8 = fillVal;
+            if (fillI8->getType() != i8Ty) {
+              if (fillI8->getType()->isIntegerTy())
+                fillI8 = CastInst::CreateIntegerCast(fillI8, i8Ty, false, "tulip.memset.val.cast", CI);
+              else
+                fillI8 = ConstantInt::get(i8Ty, 0);
+            }
+
+            Value *size64 = setSize;
+            if (size64->getType() != i64Ty) {
+              if (size64->getType()->isIntegerTy())
+                size64 = CastInst::CreateIntegerCast(size64, i64Ty, false, "tulip.memset.size.cast", CI);
+              else
+                size64 = ConstantInt::get(i64Ty, 0);
+            }
+            ConstantInt *sizeImm = dyn_cast<ConstantInt>(size64);
+            if (!sizeImm) {
+              errs() << "mergeKernel: WARN: non-constant cudaMemset size, keeping call: "
+                     << *CI << "\n";
+              continue;
+            }
+            uint64_t setBytes = sizeImm->getZExtValue();
+            for (uint64_t b = 0; b < setBytes; ++b) {
+              Value *idx = ConstantInt::get(i64Ty, b);
+              Value *dstByte = GetElementPtrInst::Create(
+                  i8Ty, dstPtr, {idx}, "tulip.memset.byte.ptr", CI);
+              new StoreInst(fillI8, dstByte, CI);
+            }
+
+            funcs2delete.insert(calledFunc);
+            if (!CI->use_empty())
+              CI->replaceAllUsesWith(ConstantInt::get(CI->getType(), 0));
+            insts2Remove.push_back(CI);
+          }
           else if(calledFunc->getName().contains("cudaMemcpy")){
             if (CI->arg_size() < 4) {
               errs() << "mergeKernel: WARN: unexpected cudaMemcpy signature, skipping transform: "
@@ -1417,6 +1739,45 @@ struct MergeKernel : public ModulePass {
               errs() << "ANDREW: mergeKernel: skipping cudaMemcpy rewrite due to unsupported memory objects\n";
               continue;
             }
+
+            Function *memcpyFunc = CI->getFunction();
+            auto isSafeMemcpyLoadRewrite = [&](LoadInst *ld) -> bool {
+              if (!ld)
+                return false;
+              Function *ldFunc = ld->getFunction();
+              if (ldFunc != memcpyFunc) {
+                // Keep alloca-backed rewrites strictly intra-function to avoid
+                // leaking stack values across function boundaries. For global-
+                // backed mappings, allow cross-function rewrites (CG uses this).
+                if (isa<AllocaInst>(originalAlloc) || isa<AllocaInst>(devAlloc)) {
+                  errs() << "mergeKernel: skipping cross-function load rewrite in cudaMemcpy: "
+                         << (ldFunc ? ldFunc->getName() : "<null>")
+                         << " vs " << (memcpyFunc ? memcpyFunc->getName() : "<null>") << "\n";
+                  return false;
+                }
+                errs() << "mergeKernel: allowing cross-function global load rewrite in cudaMemcpy: "
+                       << (ldFunc ? ldFunc->getName() : "<null>")
+                       << " vs " << (memcpyFunc ? memcpyFunc->getName() : "<null>") << "\n";
+              }
+
+              if (AllocaInst *origAlloca = dyn_cast<AllocaInst>(originalAlloc)) {
+                if (origAlloca->getFunction() != ldFunc) {
+                  errs() << "mergeKernel: skipping unsafe alloca rewrite in cudaMemcpy: alloca in "
+                         << origAlloca->getFunction()->getName()
+                         << ", load in " << (ldFunc ? ldFunc->getName() : "<null>") << "\n";
+                  return false;
+                }
+              }
+              return true;
+            };
+
+            std::vector<LoadInst*> devAllocLoadUsers;
+            for (User *user : devAlloc->users()) {
+              if (LoadInst *ld = dyn_cast<LoadInst>(user)) {
+                if (isSafeMemcpyLoadRewrite(ld))
+                  devAllocLoadUsers.push_back(ld);
+              }
+            }
             
             if(originalLd)
               errs() << "ANDREW: mergeKernel: originalLd " << *originalLd << "\n";
@@ -1466,43 +1827,39 @@ struct MergeKernel : public ModulePass {
             Type* originalPointeeType = originalAlloc->getType()->getPointerElementType();
             if (ArrayType *arrTy = dyn_cast<ArrayType>(originalPointeeType)) {
               (void)arrTy;
-              std::vector<User*> devAllocUsers;
-              for (auto user : devAlloc->users())
-                devAllocUsers.push_back(user);
-
-              for (auto user : devAllocUsers) {
-                if (LoadInst *ld = dyn_cast<LoadInst>(user)) {
-                  Type* i64Ty = Type::getInt64Ty(ld->getContext());
-                  std::vector<Value*> idxs = {
-                    ConstantInt::get(i64Ty, 0),
-                    ConstantInt::get(i64Ty, 0)
-                  };
-                  GetElementPtrInst* gep = GetElementPtrInst::Create(
-                    originalPointeeType,
-                    originalAlloc,
-                    idxs,
-                    "staticArrayPtr",
-                    ld
-                  );
-                  errs() << "mergeKernel: replacing load with GEP for static array: " << *gep << "\n";
-                  ld->replaceAllUsesWith(gep);
-                  ld->eraseFromParent();
+              for (LoadInst *ld : devAllocLoadUsers) {
+                if (ld->use_empty()) {
+                  errs() << "mergeKernel: skipping empty load during static array rewrite: " << *ld << "\n";
+                  continue;
                 }
+                Type* i64Ty = Type::getInt64Ty(ld->getContext());
+                std::vector<Value*> idxs = {
+                  ConstantInt::get(i64Ty, 0),
+                  ConstantInt::get(i64Ty, 0)
+                };
+                GetElementPtrInst* gep = GetElementPtrInst::Create(
+                  originalPointeeType,
+                  originalAlloc,
+                  idxs,
+                  "staticArrayPtr",
+                  ld
+                );
+                errs() << "mergeKernel: replacing load with GEP for static array: " << *gep << "\n";
+                ld->replaceAllUsesWith(gep);
+                ld->eraseFromParent();
               }
             } else if (originalPointeeType->isPointerTy()) {
-              std::vector<User*> devAllocUsers;
-              for (auto user : devAlloc->users())
-                devAllocUsers.push_back(user);
-
-              for (auto user : devAllocUsers) {
-                if (LoadInst *ld = dyn_cast<LoadInst>(user)) {
-                  if (ld->getType() == originalPointeeType) {
-                    ld->setOperand(0, originalAlloc);
-                  } else {
-                    auto cast = CastInst::CreatePointerCast(
-                        originalAlloc, ld->getOperand(0)->getType(), "castHost", ld);
-                    ld->setOperand(0, cast);
-                  }
+              for (LoadInst *ld : devAllocLoadUsers) {
+                if (ld->use_empty()) {
+                  errs() << "mergeKernel: skipping empty load during pointer rewrite: " << *ld << "\n";
+                  continue;
+                }
+                if (ld->getType() == originalPointeeType) {
+                  ld->setOperand(0, originalAlloc);
+                } else {
+                  auto cast = CastInst::CreatePointerCast(
+                      originalAlloc, ld->getOperand(0)->getType(), "castHost", ld);
+                  ld->setOperand(0, cast);
                 }
               }
             } else if (devLd) {
@@ -1869,29 +2226,38 @@ struct MergeKernel : public ModulePass {
      std::vector<GlobalVariable*> globalsToDelete; // Original address space 3 globals to delete
      std::map<std::string, int> nameCounts; // Track name usage to avoid conflicts
      
-     auto extractVarName = [](const std::string& mangledName) -> std::string {
-         size_t ePos = mangledName.find_last_of('E');
-         if(ePos != std::string::npos && ePos + 1 < mangledName.length()){
-             size_t startPos = ePos + 1;
-             while(startPos < mangledName.length() && std::isdigit(mangledName[startPos])){
-                 startPos++;
-             }
-             if(startPos < mangledName.length()){
-                 return mangledName.substr(startPos);
-             }
-         }
-         // Fallback: try demangling
-         std::string demangled = demangle(mangledName);
-         if(!demangled.empty() && demangled != mangledName){
-             size_t lastSep = demangled.rfind("::");
-             if(lastSep != std::string::npos && lastSep + 2 < demangled.length()){
-                 return demangled.substr(lastSep + 2);
-             }
-             return demangled;
-         }
-         
-         return mangledName;
-     };
+    auto extractVarName = [](const std::string& mangledName) -> std::string {
+        // Prefer Itanium demangling for globals like _ZL11grid_points.
+        std::string demangled = demangle(mangledName);
+        if (!demangled.empty() && demangled != mangledName) {
+            // Trim any function/signature tail if present.
+            size_t parenPos = demangled.find('(');
+            if (parenPos != std::string::npos)
+                demangled = demangled.substr(0, parenPos);
+
+            // Keep the innermost identifier for namespace/class-qualified names.
+            size_t lastSep = demangled.rfind("::");
+            if (lastSep != std::string::npos && lastSep + 2 < demangled.length())
+                demangled = demangled.substr(lastSep + 2);
+
+            if (!demangled.empty())
+                return demangled;
+        }
+
+        // Legacy heuristic for partially mangled forms.
+        size_t ePos = mangledName.find_last_of('E');
+        if (ePos != std::string::npos && ePos + 1 < mangledName.length()) {
+            size_t startPos = ePos + 1;
+            while (startPos < mangledName.length() &&
+                   std::isdigit(static_cast<unsigned char>(mangledName[startPos]))) {
+                startPos++;
+            }
+            if (startPos < mangledName.length())
+                return mangledName.substr(startPos);
+        }
+
+        return mangledName;
+    };
      
      // Find all address space 3 globals and create corresponding address space 0 globals
      for (Module::global_iterator I = M.global_begin(), E = M.global_end();
@@ -2068,9 +2434,9 @@ struct MergeKernel : public ModulePass {
          
          for(User *CastU : castUsers){
              if(Instruction *I = dyn_cast<Instruction>(CastU)){
-                I->replaceUsesOfWith(castExpr, newGlob);
+               I->replaceUsesOfWith(castExpr, castReplacement);
                 errs() << "mergeKernel: Replaced addrspacecast use in " << *I << "\n";
-                errs() << "ANDREW: shared-lowering rewired addrspacecast to " << newGlob->getName() << "\n";
+               errs() << "ANDREW: shared-lowering rewired addrspacecast to replacement constant\n";
              } else if (ConstantExpr *CE = dyn_cast<ConstantExpr>(CastU)) {
                 errs() << "ANDREW: shared-lowering unresolved constexpr user of addrspacecast "
                        << *CE << "\n";
