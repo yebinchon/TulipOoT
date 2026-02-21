@@ -28,6 +28,9 @@
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Transforms/Utils/PromoteMemToReg.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 
 // YEBIN: added libs
 #include "llvm/IR/IRBuilder.h"
@@ -62,6 +65,51 @@ struct MergeKernel : public ModulePass {
   void getAnalysisUsage(AnalysisUsage &AU) const {
     AU.addRequired<LoopInfoWrapperPass>();
     AU.addRequired<DominatorTreeWrapperPass>();
+  }
+
+  bool hasUnsafeBlockCollapseSemantics(Function *F) {
+    if (!F) return false;
+
+    // Barriers imply block-level coordination semantics.
+    for (auto &BB : *F) {
+      for (auto &I : BB) {
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+          if (Function *Callee = CI->getCalledFunction()) {
+            if (Callee->getName().contains("llvm.nvvm.barrier"))
+              return true;
+          }
+        }
+      }
+    }
+
+    // Shared-memory usage is lowered to TLS globals later. Collapsing grid/block
+    // loops can split one CUDA block's logical threads across host workers and
+    // break reductions/cooperation done through shared arrays.
+    for (auto &BB : *F) {
+      for (auto &I : BB) {
+        for (Use &Op : I.operands()) {
+          Value *V = Op.get();
+          if (!V) continue;
+
+          Value *Base = V->stripPointerCasts();
+          if (auto *GV = dyn_cast<GlobalVariable>(Base)) {
+            if (GV->getAddressSpace() == 3)
+              return true;
+          }
+
+          if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+            if (CE->getOpcode() == Instruction::AddrSpaceCast) {
+              if (auto *SrcGV = dyn_cast<GlobalVariable>(CE->getOperand(0))) {
+                if (SrcGV->getAddressSpace() == 3)
+                  return true;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return false;
   }
 
   // Replace inlined CUDA device log function (_ZL3logd) with a simple log() call
@@ -652,6 +700,229 @@ struct MergeKernel : public ModulePass {
     }
   }
 
+  void eraseBasicBlockRegion(Function *Func, const std::set<BasicBlock*> &eraseList) {
+    if (eraseList.empty()) return;
+
+    LLVMContext &Ctx = Func->getContext();
+    BasicBlock *cleanupRetBB = nullptr;
+    auto ensureCleanupRetBlock = [&]() -> BasicBlock* {
+      if (cleanupRetBB) return cleanupRetBB;
+      cleanupRetBB = BasicBlock::Create(Ctx, "mergeKernel.split.cleanup.ret", Func);
+      IRBuilder<> SinkBuilder(cleanupRetBB);
+      if (Func->getReturnType()->isVoidTy()) {
+        SinkBuilder.CreateRetVoid();
+      } else {
+        SinkBuilder.CreateRet(UndefValue::get(Func->getReturnType()));
+      }
+      errs() << "ANDREW: splitFunction created cleanup return block in "
+             << Func->getName() << "\n";
+      return cleanupRetBB;
+    };
+
+    // Rewire external edges into region blocks so we can erase the region safely.
+    for (auto &BB : *Func) {
+      if (eraseList.count(&BB)) continue;
+      auto *TI = BB.getTerminator();
+      if (!TI) continue;
+      for (unsigned SI = 0; SI < TI->getNumSuccessors(); ++SI) {
+        BasicBlock *Succ = TI->getSuccessor(SI);
+        if (!eraseList.count(Succ)) continue;
+        BasicBlock *CleanupRet = ensureCleanupRetBlock();
+        TI->setSuccessor(SI, CleanupRet);
+        errs() << "ANDREW: splitFunction rewired edge " << BB.getName()
+               << " -> " << Succ->getName() << " to cleanup return block\n";
+      }
+    }
+
+    // Repair PHI incoming edges in surviving blocks that referenced deleted preds.
+    for (auto &BB : *Func) {
+      if (eraseList.count(&BB)) continue;
+      for (auto It = BB.begin(); It != BB.end(); ) {
+        PHINode *PN = dyn_cast<PHINode>(&*It);
+        if (!PN) break;
+        ++It;
+        for (int I = static_cast<int>(PN->getNumIncomingValues()) - 1; I >= 0; --I) {
+          BasicBlock *IncomingBB = PN->getIncomingBlock(I);
+          if (!eraseList.count(IncomingBB)) continue;
+          errs() << "ANDREW: splitFunction removing PHI incoming from "
+                 << IncomingBB->getName() << " in " << BB.getName() << "\n";
+          PN->removeIncomingValue(I, false);
+        }
+      }
+    }
+
+    for (auto *DeadBB : eraseList) {
+      if (DeadBB->getParent() == Func)
+        DeadBB->dropAllReferences();
+    }
+    for (auto *DeadBB : eraseList) {
+      if (DeadBB->getParent() == Func)
+        DeadBB->eraseFromParent();
+    }
+  }
+
+  std::set<BasicBlock*> collectPostSplitRegion(BasicBlock *splitPoint) {
+    std::set<BasicBlock*> region;
+    for (df_iterator<BasicBlock*> SI = df_begin(splitPoint); SI != df_end(splitPoint); ++SI) {
+      region.insert(*SI);
+    }
+    return region;
+  }
+
+  std::vector<Value*> collectPostSplitLiveIns(Function *F, const std::set<BasicBlock*> &region) {
+    std::vector<Value*> liveIns;
+    std::set<Value*> seen;
+    for (auto &BB : *F) {
+      if (!region.count(&BB)) continue;
+      for (auto &I : BB) {
+        for (Use &U : I.operands()) {
+          Value *Op = U.get();
+          if (!Op) continue;
+          if (isa<Constant>(Op) || isa<Function>(Op) || isa<GlobalVariable>(Op))
+            continue;
+          if (Instruction *DefI = dyn_cast<Instruction>(Op)) {
+            if (region.count(DefI->getParent())) continue;
+            if (seen.insert(Op).second)
+              liveIns.push_back(Op);
+          }
+        }
+      }
+    }
+    return liveIns;
+  }
+
+  Value *resolveLiveInAtCallSite(Value *LiveIn, CallInst *CallI) {
+    if (Argument *A = dyn_cast<Argument>(LiveIn))
+      return CallI->getArgOperand(A->getArgNo());
+    if (isa<Constant>(LiveIn) || isa<GlobalValue>(LiveIn))
+      return LiveIn;
+    return nullptr;
+  }
+
+  bool canMaterializeLiveIn(Value *V, DenseSet<Value*> &visiting) {
+    if (!V) return false;
+    if (isa<Argument>(V) || isa<Constant>(V) || isa<GlobalValue>(V))
+      return true;
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I) return false;
+    if (isa<PHINode>(I) || isa<AllocaInst>(I) || isa<LoadInst>(I) ||
+        isa<StoreInst>(I) || isa<CallInst>(I))
+      return false;
+    if (!visiting.insert(V).second) return false;
+    for (Value *Op : I->operands()) {
+      if (!canMaterializeLiveIn(Op, visiting)) {
+        visiting.erase(V);
+        return false;
+      }
+    }
+    visiting.erase(V);
+    return true;
+  }
+
+  Value *materializeLiveInAtCallSite(Value *V, CallInst *CallI, IRBuilder<> &B,
+                                     DenseMap<Value*, Value*> &cache) {
+    if (!V) return nullptr;
+    if (cache.count(V)) return cache[V];
+    if (Argument *A = dyn_cast<Argument>(V))
+      return cache[V] = CallI->getArgOperand(A->getArgNo());
+    if (isa<Constant>(V) || isa<GlobalValue>(V))
+      return cache[V] = V;
+
+    Instruction *I = dyn_cast<Instruction>(V);
+    if (!I) return nullptr;
+
+    auto matOp = [&](Value *Op) -> Value* {
+      return materializeLiveInAtCallSite(Op, CallI, B, cache);
+    };
+
+    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+      Value *L = matOp(BO->getOperand(0));
+      Value *R = matOp(BO->getOperand(1));
+      if (!L || !R) return nullptr;
+      return cache[V] = B.CreateBinOp(BO->getOpcode(), L, R, "livein.mat");
+    }
+    if (auto *IC = dyn_cast<ICmpInst>(I)) {
+      Value *L = matOp(IC->getOperand(0));
+      Value *R = matOp(IC->getOperand(1));
+      if (!L || !R) return nullptr;
+      return cache[V] = B.CreateICmp(IC->getPredicate(), L, R, "livein.mat");
+    }
+    if (auto *FC = dyn_cast<FCmpInst>(I)) {
+      Value *L = matOp(FC->getOperand(0));
+      Value *R = matOp(FC->getOperand(1));
+      if (!L || !R) return nullptr;
+      return cache[V] = B.CreateFCmp(FC->getPredicate(), L, R, "livein.mat");
+    }
+    if (auto *SI = dyn_cast<SelectInst>(I)) {
+      Value *C = matOp(SI->getCondition());
+      Value *T = matOp(SI->getTrueValue());
+      Value *F = matOp(SI->getFalseValue());
+      if (!C || !T || !F) return nullptr;
+      return cache[V] = B.CreateSelect(C, T, F, "livein.mat");
+    }
+    if (auto *Cast = dyn_cast<CastInst>(I)) {
+      Value *Op = matOp(Cast->getOperand(0));
+      if (!Op) return nullptr;
+      return cache[V] = B.CreateCast(Cast->getOpcode(), Op, Cast->getType(), "livein.mat");
+    }
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(I)) {
+      Value *Base = matOp(GEP->getPointerOperand());
+      if (!Base) return nullptr;
+      SmallVector<Value*, 8> Idx;
+      for (Value *IdxV : GEP->indices()) {
+        Value *MatIdx = matOp(IdxV);
+        if (!MatIdx) return nullptr;
+        Idx.push_back(MatIdx);
+      }
+      if (GEP->isInBounds())
+        return cache[V] = B.CreateInBoundsGEP(GEP->getSourceElementType(), Base, Idx, "livein.mat");
+      return cache[V] = B.CreateGEP(GEP->getSourceElementType(), Base, Idx, "livein.mat");
+    }
+    return nullptr;
+  }
+
+  bool promoteKernelAllocasToSSA(Function *F) {
+    if (!F || F->isDeclaration()) return false;
+    BasicBlock &Entry = F->getEntryBlock();
+    SmallVector<AllocaInst*, 32> promotableAllocas;
+    for (Instruction &I : Entry) {
+      AllocaInst *AI = dyn_cast<AllocaInst>(&I);
+      if (!AI) continue;
+      if (isAllocaPromotable(AI))
+        promotableAllocas.push_back(AI);
+    }
+    if (promotableAllocas.empty()) return false;
+    DominatorTree DT(*F);
+    PromoteMemToReg(promotableAllocas, DT);
+    errs() << "ANDREW: splitFunction mem2reg promoted allocas in " << F->getName()
+           << ", count=" << promotableAllocas.size() << "\n";
+    return true;
+  }
+
+  void replaceTerminatorWithReturnAndRepairPhis(BasicBlock *BB, IRBuilder<> &Builder) {
+    if (!BB) return;
+    Instruction *OldTerm = BB->getTerminator();
+    if (!OldTerm) return;
+
+    SmallVector<BasicBlock*, 4> oldSuccs;
+    for (unsigned SI = 0; SI < OldTerm->getNumSuccessors(); ++SI)
+      oldSuccs.push_back(OldTerm->getSuccessor(SI));
+
+    SmallPtrSet<BasicBlock*, 4> dedupSuccs(oldSuccs.begin(), oldSuccs.end());
+    for (BasicBlock *Succ : dedupSuccs) {
+      if (!Succ) continue;
+      Succ->removePredecessor(BB, false);
+    }
+
+    Builder.SetInsertPoint(OldTerm);
+    Type *RetTy = BB->getParent()->getReturnType();
+    if (RetTy->isVoidTy())
+      Builder.CreateRetVoid();
+    else
+      Builder.CreateRet(UndefValue::get(RetTy));
+    OldTerm->eraseFromParent();
+  }
+
   void splitFunction(LLVMContext &Context, Function* F, std::set<Instruction*> insts) {
     IRBuilder<> Builder(Context);
     unsigned barrierCount = insts.size();
@@ -667,9 +938,29 @@ struct MergeKernel : public ModulePass {
       auto *BB = syncInst->getParent();
       auto *splitPoint = BB->splitBasicBlock(syncInst, "syncpoint."+std::to_string(barrierCount));
       auto* LI = &getAnalysis<LoopInfoWrapperPass>(*F).getLoopInfo();
+      std::set<BasicBlock*> postSplitRegion = collectPostSplitRegion(splitPoint);
+      std::vector<Value*> liveIns = collectPostSplitLiveIns(F, postSplitRegion);
+      std::vector<Value*> passableLiveIns;
+      for (Value *V : liveIns) {
+        DenseSet<Value*> visiting;
+        if (isa<Argument>(V) || isa<Constant>(V) || isa<GlobalValue>(V) ||
+            canMaterializeLiveIn(V, visiting))
+          passableLiveIns.push_back(V);
+        else
+          errs() << "ANDREW: splitFunction unresolved instruction live-in: " << *V << "\n";
+      }
+      errs() << "ANDREW: splitFunction discovered live-ins=" << liveIns.size()
+             << ", passable live-ins=" << passableLiveIns.size() << "\n";
+
+      std::vector<Type*> newParamTypes;
+      for (auto &Arg : F->args()) newParamTypes.push_back(Arg.getType());
+      for (Value *V : passableLiveIns) newParamTypes.push_back(V->getType());
+      FunctionType *newFuncTy =
+          FunctionType::get(F->getReturnType(), newParamTypes, F->isVarArg());
+
       // create new kernel function
       auto *newFunc = Function::Create(
-            F->getFunctionType(),
+            newFuncTy,
             F->getLinkage(),
             orignalName+std::to_string(barrierCount--),
             F->getParent()
@@ -682,17 +973,70 @@ struct MergeKernel : public ModulePass {
         NewFArgIt->setName(ArgName);
         VMap[&Arg] = &(*NewFArgIt++);
       }
+      std::vector<Argument*> newLiveInArgs;
+      DenseMap<Value*, Argument*> liveInArgMap;
+      for (unsigned I = 0; I < passableLiveIns.size(); ++I) {
+        NewFArgIt->setName("livein." + std::to_string(I));
+        newLiveInArgs.push_back(&(*NewFArgIt));
+        liveInArgMap[passableLiveIns[I]] = &(*NewFArgIt);
+        VMap[passableLiveIns[I]] = &(*NewFArgIt++);
+      }
+      errs() << "ANDREW: splitFunction appended " << newLiveInArgs.size()
+             << " live-in args to " << newFunc->getName() << "\n";
 
       SmallVector<ReturnInst*, 8> Returns;
       llvm::CloneFunctionInto(newFunc, F, VMap, false, Returns);
-      auto *newBB = cast<Instruction>(*VMap[BB->getTerminator()]).getParent();
+      // Barrier is the split marker between two kernel launches now.
+      // Keep it out of the post-split clone to avoid emitting sync no-ops.
+      if (Instruction *MappedSync = dyn_cast<Instruction>(VMap[syncInst])) {
+        errs() << "ANDREW: splitFunction removing cloned sync marker in "
+               << newFunc->getName() << ": " << *MappedSync << "\n";
+        MappedSync->eraseFromParent();
+      }
+      // CloneFunctionInto may re-map old instruction live-ins to cloned defs.
+      // Force all passable live-ins in the cloned function to use appended args.
+      for (Value *OldLiveIn : passableLiveIns) {
+        auto ArgIt = liveInArgMap.find(OldLiveIn);
+        if (ArgIt == liveInArgMap.end()) continue;
+        Argument *LiveInArg = ArgIt->second;
+        auto MapIt = VMap.find(OldLiveIn);
+        if (MapIt == VMap.end()) continue;
+        Value *MappedV = MapIt->second;
+        if (!MappedV || MappedV == LiveInArg) continue;
+        Instruction *MappedI = dyn_cast<Instruction>(MappedV);
+        if (!MappedI) continue;
+        errs() << "ANDREW: splitFunction post-clone rewiring live-in "
+               << *MappedI << " -> " << *LiveInArg << "\n";
+        MappedI->replaceAllUsesWith(LiveInArg);
+      }
       auto *newSplitBB = cast<Instruction>(*VMap[splitPoint->getTerminator()]).getParent();
+      std::set<BasicBlock*> newPostSplitRegion;
+      for (BasicBlock *OldBB : postSplitRegion) {
+        auto ItMapped = VMap.find(OldBB->getTerminator());
+        if (ItMapped == VMap.end()) continue;
+        Instruction *MappedTerm = dyn_cast<Instruction>(ItMapped->second);
+        if (!MappedTerm) continue;
+        BasicBlock *MappedBB = MappedTerm->getParent();
+        if (MappedBB) newPostSplitRegion.insert(MappedBB);
+      }
 
       // call newly split function
       for(auto *callInst: kernelCalls[F]) {
         Builder.SetInsertPoint(callInst->getNextNode());
         std::vector<Value*> args;
         for(auto &arg: callInst->args()) args.push_back(arg);
+        DenseMap<Value*, Value*> liveInCache;
+        for (Value *LiveIn : passableLiveIns) {
+          Value *Resolved = materializeLiveInAtCallSite(LiveIn, callInst, Builder, liveInCache);
+          if (!Resolved)
+            Resolved = resolveLiveInAtCallSite(LiveIn, callInst);
+          if (!Resolved) {
+            errs() << "ANDREW: splitFunction live-in unresolved at callsite: "
+                   << *LiveIn << "\n";
+            continue;
+          }
+          args.push_back(Resolved);
+        }
         Builder.CreateCall(newFunc, args);
       }
 
@@ -702,32 +1046,27 @@ struct MergeKernel : public ModulePass {
 
       // all predecessors of splitPoint (not inclusive) are part of prevF
       // others are part of splitF
-      Builder.SetInsertPoint(BB->getTerminator());
-      Builder.CreateRetVoid();
-      BB->getTerminator()->eraseFromParent();
+      replaceTerminatorWithReturnAndRepairPhis(BB, Builder);
 
       std::set<BasicBlock*> prevEraseList;
       std::set<BasicBlock*> splitEraseList;
       // workaround for use-def errors
-      for(df_iterator<BasicBlock*> SI = df_begin(splitPoint); SI != df_end(splitPoint); ++SI) {
-        BasicBlock* succ = *SI;
-        prevEraseList.insert(succ);
-      }
+      prevEraseList = postSplitRegion;
       for(auto &bb: prevEraseList) {
-        Builder.SetInsertPoint(bb->getTerminator());
-        Builder.CreateRetVoid();
-        bb->getTerminator()->eraseFromParent();
+        replaceTerminatorWithReturnAndRepairPhis(bb, Builder);
       }
-      for(auto &bb: prevEraseList) bb->eraseFromParent();
+      // NOTE: In SSA-promoted mode, physically deleting these blocks can still
+      // break def-use closure across conservative split regions. Keep rewritten
+      // returns and let later cleanup passes remove dead/unreachable blocks.
+      // eraseBasicBlockRegion(F, prevEraseList);
 
-      // All successors of splitPoint (inclusive) are part of splitF
-      // Previous instruction must also be considered
-      // FIXME: assumes all "setup" insts are in the entry block
-      // TODO: Live-in Live-out analyses, modify function signature
-      for(idf_iterator<BasicBlock*> PI = idf_begin(newBB); PI != idf_end(newBB); ++PI) {
-        BasicBlock* pred = *PI;
-        if (pred != &newFunc->getEntryBlock())
-          splitEraseList.insert(pred);
+      // Keep exactly the mapped post-split region in the cloned function.
+      // This avoids deleting defs still used by kept post-sync blocks.
+      for (BasicBlock &CandBB : *newFunc) {
+        BasicBlock *Pred = &CandBB;
+        if (Pred == &newFunc->getEntryBlock()) continue;
+        if (!newPostSplitRegion.count(Pred))
+          splitEraseList.insert(Pred);
       }
       // handle entry block seperately
       Builder.SetInsertPoint(newFunc->getEntryBlock().getTerminator());
@@ -735,11 +1074,12 @@ struct MergeKernel : public ModulePass {
       newFunc->getEntryBlock().getTerminator()->eraseFromParent();
       // same as prevF
       for(auto &bb: splitEraseList) {
-        Builder.SetInsertPoint(bb->getTerminator());
-        Builder.CreateRetVoid();
-        bb->getTerminator()->eraseFromParent();
+        replaceTerminatorWithReturnAndRepairPhis(bb, Builder);
       }
-      for(auto &bb: splitEraseList) bb->eraseFromParent();
+      // NOTE: In SSA-promoted mode, physically deleting these blocks can still
+      // break def-use closure across conservative split regions. Keep rewritten
+      // returns and let later cleanup passes remove dead/unreachable blocks.
+      // eraseBasicBlockRegion(newFunc, splitEraseList);
     }
   }
 
@@ -789,24 +1129,38 @@ struct MergeKernel : public ModulePass {
       remapInstructionsInBlocks(newBlocks, VMap);
       entering->getTerminator()->replaceUsesOfWith(prevLoop->getLoopPreheader(), newLoop->getLoopPreheader());
       newLoop->getHeader()->getTerminator()->replaceUsesOfWith(threadLoop->getExitBlock(), prevLoop->getLoopPreheader());
-      auto* call = cast<Instruction>(VMap[I]);
-      for(unsigned j = 0; j <= cloneNum; j++) {
-        auto* tempCall = call;
-        call = call->getNextNode();
+      auto *mappedSeed = cast<Instruction>(VMap[I]);
+      std::vector<CallInst*> clonedCalls;
+      for (Instruction *Scan = mappedSeed;
+           Scan && Scan->getParent() == mappedSeed->getParent() &&
+           clonedCalls.size() < cloneNum + 1;
+           Scan = Scan->getNextNode()) {
+        if (CallInst *CI = dyn_cast<CallInst>(Scan))
+          clonedCalls.push_back(CI);
+      }
+      assert(clonedCalls.size() == cloneNum + 1 &&
+             "Failed to collect expected cloned kernel calls");
+      for(unsigned j = 0; j < clonedCalls.size(); j++) {
         errs() << "IDX: " << i+j << "\n";
-        if(j+i != cloneNum - 1)
-          tempCall->eraseFromParent();
+        if(j + i != cloneNum - 1)
+          clonedCalls[j]->eraseFromParent();
       }
 
       prevLoop = newLoop;
     }
     // Original loop, now last one
+    std::vector<CallInst*> originalCalls;
+    for (Instruction *Scan = I;
+         Scan && Scan->getParent() == I->getParent() &&
+         originalCalls.size() < cloneNum + 1;
+         Scan = Scan->getNextNode()) {
+      if (CallInst *CI = dyn_cast<CallInst>(Scan))
+        originalCalls.push_back(CI);
+    }
+    assert(originalCalls.size() == cloneNum + 1 &&
+           "Failed to collect expected original kernel calls");
     for(unsigned j = 0; j < cloneNum; j++) {
-      auto* tempI = I;
-      CallInst* CI = dyn_cast<CallInst>(I->getNextNode());
-      assert(CI && "Next inst is not a CallInst!!\n");
-      I = CI;
-      tempI->eraseFromParent();
+      originalCalls[j]->eraseFromParent();
     }
   }
 
@@ -1778,6 +2132,27 @@ struct MergeKernel : public ModulePass {
                   devAllocLoadUsers.push_back(ld);
               }
             }
+
+            // Fallback for H2D copies where source is an alloca-backed pointer
+            // argument (e.g. setup_gpu(a, c)). Cross-function load rewrites are
+            // intentionally blocked for allocas, so make the device pointer slot
+            // explicitly alias the host pointer in the memcpy function.
+            if (mode->isOne() && originalLd && isa<AllocaInst>(originalAlloc)) {
+              if (devAlloc->getType()->isPointerTy()) {
+                auto *devPtrTy = cast<PointerType>(devAlloc->getType());
+                Type *storeTy = devPtrTy->getPointerElementType();
+                if (storeTy && storeTy->isPointerTy()) {
+                  Value *srcPtr = originalLd;
+                  if (srcPtr->getType() != storeTy) {
+                    srcPtr = CastInst::CreatePointerCast(
+                        srcPtr, storeTy, "tulip.cudaMemcpy.alias.cast", CI);
+                  }
+                  new StoreInst(srcPtr, devAlloc, CI);
+                  errs() << "mergeKernel: emitted H2D pointer-alias fallback store for alloca source: "
+                         << *CI << "\n";
+                }
+              }
+            }
             
             if(originalLd)
               errs() << "ANDREW: mergeKernel: originalLd " << *originalLd << "\n";
@@ -2069,6 +2444,8 @@ struct MergeKernel : public ModulePass {
                 !syncInsts[kernelProfile->newFunc].empty()) {
               mayFissionKernel = true;
             }
+            bool unsafeBlockCollapse =
+                mayFissionKernel || hasUnsafeBlockCollapseSemantics(kernelProfile->newFunc);
             if(kernelProfile->dim2classify[header2itNum[header]] == 1 ||
                 kernelProfile->dim2classify[header2itNum[header]] == 2){
               LLVMContext& C = term->getContext();
@@ -2079,12 +2456,11 @@ struct MergeKernel : public ModulePass {
                 term->setMetadata("tulip.doall.loop.grid", N);
               }
               if(kernelProfile->dim2classify[header2itNum[header]] == 2){
-                // If kernel is likely fissioned, avoid block tag so codegen
-                // cannot form collapse(2) on a non-perfect nest.
-                if (!mayFissionKernel)
+                if (!unsafeBlockCollapse) {
                   term->setMetadata("tulip.doall.loop.block", N);
-                else
-                  errs() << "ANDREW: skip block doall metadata for fission-prone kernel to avoid invalid collapse\n";
+                } else {
+                  errs() << "ANDREW: skip block doall metadata due to shared/sync semantics (unsafe collapse)\n";
+                }
               }
               errs() << "mergeKernel: create metadata" << *term << "\n";
             }
@@ -2485,6 +2861,9 @@ struct MergeKernel : public ModulePass {
      }
 
     //Split function at synchronization points
+    for (auto [func, insts] : syncInsts) {
+      promoteKernelAllocasToSSA(func);
+    }
     for(auto [func, insts]: syncInsts) {
       splitFunction(M.getContext(), func, insts);
       for(auto callinst: kernelCalls[func])
