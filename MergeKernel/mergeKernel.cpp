@@ -14,6 +14,7 @@
 #include "llvm/IR/Type.h"
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -923,164 +924,263 @@ struct MergeKernel : public ModulePass {
     OldTerm->eraseFromParent();
   }
 
-  void splitFunction(LLVMContext &Context, Function* F, std::set<Instruction*> insts) {
-    IRBuilder<> Builder(Context);
-    unsigned barrierCount = insts.size();
-    // Convert to std::string and remove null bytes to prevent assertion failures
-    std::string orignalName = F->getName().str();
-    orignalName.erase(std::remove(orignalName.begin(), orignalName.end(), '\0'), orignalName.end());
-    F->setName(orignalName+"0");
+  void sanitizeClonedEntryBlock(BasicBlock *Entry) {
+    if (!Entry) return;
 
-    // Order needs to be later instructions first
-    // Is it preserved?
-    for(auto it = insts.rbegin(); it != insts.rend(); it++) {
-      Instruction *syncInst = *it;
-      auto *BB = syncInst->getParent();
-      auto *splitPoint = BB->splitBasicBlock(syncInst, "syncpoint."+std::to_string(barrierCount));
-      auto* LI = &getAnalysis<LoopInfoWrapperPass>(*F).getLoopInfo();
-      std::set<BasicBlock*> postSplitRegion = collectPostSplitRegion(splitPoint);
-      std::vector<Value*> liveIns = collectPostSplitLiveIns(F, postSplitRegion);
-      std::vector<Value*> passableLiveIns;
-      for (Value *V : liveIns) {
-        DenseSet<Value*> visiting;
-        if (isa<Argument>(V) || isa<Constant>(V) || isa<GlobalValue>(V) ||
-            canMaterializeLiveIn(V, visiting))
-          passableLiveIns.push_back(V);
-        else
-          errs() << "ANDREW: splitFunction unresolved instruction live-in: " << *V << "\n";
-      }
-      errs() << "ANDREW: splitFunction discovered live-ins=" << liveIns.size()
-             << ", passable live-ins=" << passableLiveIns.size() << "\n";
+    SmallVector<Instruction*, 16> toErase;
+    for (Instruction &I : *Entry) {
+      if (I.isTerminator()) continue;
 
-      std::vector<Type*> newParamTypes;
-      for (auto &Arg : F->args()) newParamTypes.push_back(Arg.getType());
-      for (Value *V : passableLiveIns) newParamTypes.push_back(V->getType());
-      FunctionType *newFuncTy =
-          FunctionType::get(F->getReturnType(), newParamTypes, F->isVarArg());
+      // Keep debug/lifetime intrinsics and value-producing defs still needed
+      // by the preserved post-split region.
+      if (isa<DbgInfoIntrinsic>(I)) continue;
+      if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+        Intrinsic::ID ID = II->getIntrinsicID();
+        if (ID == Intrinsic::lifetime_start || ID == Intrinsic::lifetime_end)
+          continue;
+      }
+      if (!I.use_empty()) continue;
 
-      // create new kernel function
-      auto *newFunc = Function::Create(
-            newFuncTy,
-            F->getLinkage(),
-            orignalName+std::to_string(barrierCount--),
-            F->getParent()
-          );
-      //copy old kernel over to the new
-      ValueToValueMapTy VMap;
-      auto NewFArgIt = newFunc->arg_begin();
-      for (auto &Arg: F->args()) {
-        auto ArgName = Arg.getName();
-        NewFArgIt->setName(ArgName);
-        VMap[&Arg] = &(*NewFArgIt++);
-      }
-      std::vector<Argument*> newLiveInArgs;
-      DenseMap<Value*, Argument*> liveInArgMap;
-      for (unsigned I = 0; I < passableLiveIns.size(); ++I) {
-        NewFArgIt->setName("livein." + std::to_string(I));
-        newLiveInArgs.push_back(&(*NewFArgIt));
-        liveInArgMap[passableLiveIns[I]] = &(*NewFArgIt);
-        VMap[passableLiveIns[I]] = &(*NewFArgIt++);
-      }
-      errs() << "ANDREW: splitFunction appended " << newLiveInArgs.size()
-             << " live-in args to " << newFunc->getName() << "\n";
-
-      SmallVector<ReturnInst*, 8> Returns;
-      llvm::CloneFunctionInto(newFunc, F, VMap, false, Returns);
-      // Barrier is the split marker between two kernel launches now.
-      // Keep it out of the post-split clone to avoid emitting sync no-ops.
-      if (Instruction *MappedSync = dyn_cast<Instruction>(VMap[syncInst])) {
-        errs() << "ANDREW: splitFunction removing cloned sync marker in "
-               << newFunc->getName() << ": " << *MappedSync << "\n";
-        MappedSync->eraseFromParent();
-      }
-      // CloneFunctionInto may re-map old instruction live-ins to cloned defs.
-      // Force all passable live-ins in the cloned function to use appended args.
-      for (Value *OldLiveIn : passableLiveIns) {
-        auto ArgIt = liveInArgMap.find(OldLiveIn);
-        if (ArgIt == liveInArgMap.end()) continue;
-        Argument *LiveInArg = ArgIt->second;
-        auto MapIt = VMap.find(OldLiveIn);
-        if (MapIt == VMap.end()) continue;
-        Value *MappedV = MapIt->second;
-        if (!MappedV || MappedV == LiveInArg) continue;
-        Instruction *MappedI = dyn_cast<Instruction>(MappedV);
-        if (!MappedI) continue;
-        errs() << "ANDREW: splitFunction post-clone rewiring live-in "
-               << *MappedI << " -> " << *LiveInArg << "\n";
-        MappedI->replaceAllUsesWith(LiveInArg);
-      }
-      auto *newSplitBB = cast<Instruction>(*VMap[splitPoint->getTerminator()]).getParent();
-      std::set<BasicBlock*> newPostSplitRegion;
-      for (BasicBlock *OldBB : postSplitRegion) {
-        auto ItMapped = VMap.find(OldBB->getTerminator());
-        if (ItMapped == VMap.end()) continue;
-        Instruction *MappedTerm = dyn_cast<Instruction>(ItMapped->second);
-        if (!MappedTerm) continue;
-        BasicBlock *MappedBB = MappedTerm->getParent();
-        if (MappedBB) newPostSplitRegion.insert(MappedBB);
-      }
-
-      // call newly split function
-      for(auto *callInst: kernelCalls[F]) {
-        Builder.SetInsertPoint(callInst->getNextNode());
-        std::vector<Value*> args;
-        for(auto &arg: callInst->args()) args.push_back(arg);
-        DenseMap<Value*, Value*> liveInCache;
-        for (Value *LiveIn : passableLiveIns) {
-          Value *Resolved = materializeLiveInAtCallSite(LiveIn, callInst, Builder, liveInCache);
-          if (!Resolved)
-            Resolved = resolveLiveInAtCallSite(LiveIn, callInst);
-          if (!Resolved) {
-            errs() << "ANDREW: splitFunction live-in unresolved at callsite: "
-                   << *LiveIn << "\n";
-            continue;
-          }
-          args.push_back(Resolved);
-        }
-        Builder.CreateCall(newFunc, args);
-      }
-
-      // prune function body based on barrier
-      // FIXME: currently assumes the synchronization is not within a loop
-      assert(!LI->getLoopFor(BB) && "The synchronization point is in a loop!!!\n");
-
-      // all predecessors of splitPoint (not inclusive) are part of prevF
-      // others are part of splitF
-      replaceTerminatorWithReturnAndRepairPhis(BB, Builder);
-
-      std::set<BasicBlock*> prevEraseList;
-      std::set<BasicBlock*> splitEraseList;
-      // workaround for use-def errors
-      prevEraseList = postSplitRegion;
-      for(auto &bb: prevEraseList) {
-        replaceTerminatorWithReturnAndRepairPhis(bb, Builder);
-      }
-      // NOTE: In SSA-promoted mode, physically deleting these blocks can still
-      // break def-use closure across conservative split regions. Keep rewritten
-      // returns and let later cleanup passes remove dead/unreachable blocks.
-      // eraseBasicBlockRegion(F, prevEraseList);
-
-      // Keep exactly the mapped post-split region in the cloned function.
-      // This avoids deleting defs still used by kept post-sync blocks.
-      for (BasicBlock &CandBB : *newFunc) {
-        BasicBlock *Pred = &CandBB;
-        if (Pred == &newFunc->getEntryBlock()) continue;
-        if (!newPostSplitRegion.count(Pred))
-          splitEraseList.insert(Pred);
-      }
-      // handle entry block seperately
-      Builder.SetInsertPoint(newFunc->getEntryBlock().getTerminator());
-      Builder.CreateBr(newSplitBB);
-      newFunc->getEntryBlock().getTerminator()->eraseFromParent();
-      // same as prevF
-      for(auto &bb: splitEraseList) {
-        replaceTerminatorWithReturnAndRepairPhis(bb, Builder);
-      }
-      // NOTE: In SSA-promoted mode, physically deleting these blocks can still
-      // break def-use closure across conservative split regions. Keep rewritten
-      // returns and let later cleanup passes remove dead/unreachable blocks.
-      // eraseBasicBlockRegion(newFunc, splitEraseList);
+      // Remove side-effecting dead instructions cloned from pre-sync entry
+      // (e.g. shared-memory stores) so the post-sync kernel cannot replay them.
+      if (I.mayHaveSideEffects())
+        toErase.push_back(&I);
     }
+
+    for (Instruction *I : toErase)
+      I->eraseFromParent();
+  }
+
+  bool isBarrierMarkerInst(Instruction *I) {
+    if (!I) return false;
+    auto *CI = dyn_cast<CallInst>(I);
+    if (!CI) return false;
+    Function *Callee = CI->getCalledFunction();
+    return Callee && Callee->getName().contains("llvm.nvvm.barrier");
+  }
+
+  std::vector<Instruction*> collectSyncMarkersInFunction(Function *F) {
+    std::vector<Instruction*> markers;
+    if (!F || F->isDeclaration()) return markers;
+
+    // Only split on barriers reachable from entry. Unreachable sync markers
+    // are stale artifacts after prior CFG rewrites and can create trivial
+    // extra split stages.
+    SmallVector<BasicBlock*, 16> worklist;
+    SmallPtrSet<BasicBlock*, 32> reachable;
+    worklist.push_back(&F->getEntryBlock());
+    while (!worklist.empty()) {
+      BasicBlock *BB = worklist.pop_back_val();
+      if (!reachable.insert(BB).second) continue;
+      for (BasicBlock *Succ : successors(BB))
+        worklist.push_back(Succ);
+    }
+
+    // Preserve deterministic ordering by scanning the function in block order
+    // and selecting only reachable barrier markers.
+    for (auto &BB : *F) {
+      if (!reachable.count(&BB)) continue;
+      for (auto &I : BB) {
+        if (isBarrierMarkerInst(&I))
+          markers.push_back(&I);
+      }
+    }
+    return markers;
+  }
+
+  bool hasReachableSubstantiveWork(Function *F) {
+    if (!F || F->isDeclaration()) return false;
+    SmallVector<BasicBlock*, 16> worklist;
+    SmallPtrSet<BasicBlock*, 32> visited;
+    worklist.push_back(&F->getEntryBlock());
+    while (!worklist.empty()) {
+      BasicBlock *BB = worklist.pop_back_val();
+      if (!visited.insert(BB).second) continue;
+      for (Instruction &I : *BB) {
+        if (isa<DbgInfoIntrinsic>(&I) || I.isTerminator()) continue;
+        if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+          Intrinsic::ID ID = II->getIntrinsicID();
+          if (ID == Intrinsic::lifetime_start || ID == Intrinsic::lifetime_end)
+            continue;
+        }
+        if (isBarrierMarkerInst(&I)) continue;
+        return true;
+      }
+      for (BasicBlock *Succ : successors(BB))
+        worklist.push_back(Succ);
+    }
+    return false;
+  }
+
+  Function *splitFunction(LLVMContext &Context, Function* F, Instruction *syncInst,
+                          unsigned splitIndex) {
+    IRBuilder<> Builder(Context);
+    if (!F || !syncInst) return nullptr;
+    if (syncInst->getFunction() != F || !isBarrierMarkerInst(syncInst)) {
+      errs() << "ANDREW: splitFunction skipped invalid sync marker in "
+             << F->getName() << "\n";
+      return nullptr;
+    }
+
+    auto *BB = syncInst->getParent();
+    auto *splitPoint = BB->splitBasicBlock(syncInst, "syncpoint." + std::to_string(splitIndex));
+    auto* LI = &getAnalysis<LoopInfoWrapperPass>(*F).getLoopInfo();
+    std::set<BasicBlock*> postSplitRegion = collectPostSplitRegion(splitPoint);
+    std::vector<Value*> liveIns = collectPostSplitLiveIns(F, postSplitRegion);
+    std::vector<Value*> passableLiveIns;
+    for (Value *V : liveIns) {
+      DenseSet<Value*> visiting;
+      if (isa<Argument>(V) || isa<Constant>(V) || isa<GlobalValue>(V) ||
+          canMaterializeLiveIn(V, visiting))
+        passableLiveIns.push_back(V);
+      else
+        errs() << "ANDREW: splitFunction unresolved instruction live-in: " << *V << "\n";
+    }
+    errs() << "ANDREW: splitFunction discovered live-ins=" << liveIns.size()
+           << ", passable live-ins=" << passableLiveIns.size() << "\n";
+
+    bool postRegionHadWork = false;
+    for (BasicBlock *RBB : postSplitRegion) {
+      for (Instruction &RI : *RBB) {
+        if (isa<DbgInfoIntrinsic>(&RI) || RI.isTerminator()) continue;
+        if (auto *II = dyn_cast<IntrinsicInst>(&RI)) {
+          Intrinsic::ID ID = II->getIntrinsicID();
+          if (ID == Intrinsic::lifetime_start || ID == Intrinsic::lifetime_end)
+            continue;
+        }
+        if (isBarrierMarkerInst(&RI)) continue;
+        postRegionHadWork = true;
+        break;
+      }
+      if (postRegionHadWork) break;
+    }
+
+    std::vector<Type*> newParamTypes;
+    for (auto &Arg : F->args()) newParamTypes.push_back(Arg.getType());
+    for (Value *V : passableLiveIns) newParamTypes.push_back(V->getType());
+    FunctionType *newFuncTy =
+        FunctionType::get(F->getReturnType(), newParamTypes, F->isVarArg());
+
+    std::string baseName = F->getName().str();
+    baseName.erase(std::remove(baseName.begin(), baseName.end(), '\0'), baseName.end());
+    std::string candidate = baseName + "_split" + std::to_string(splitIndex);
+    unsigned suffix = 0;
+    while (F->getParent()->getFunction(candidate)) {
+      candidate = baseName + "_split" + std::to_string(splitIndex) + "_" + std::to_string(++suffix);
+    }
+    auto *newFunc = Function::Create(
+          newFuncTy,
+          F->getLinkage(),
+          candidate,
+          F->getParent()
+        );
+    ValueToValueMapTy VMap;
+    auto NewFArgIt = newFunc->arg_begin();
+    for (auto &Arg: F->args()) {
+      auto ArgName = Arg.getName();
+      NewFArgIt->setName(ArgName);
+      VMap[&Arg] = &(*NewFArgIt++);
+    }
+    std::vector<Argument*> newLiveInArgs;
+    DenseMap<Value*, Argument*> liveInArgMap;
+    for (unsigned I = 0; I < passableLiveIns.size(); ++I) {
+      NewFArgIt->setName("livein." + std::to_string(I));
+      newLiveInArgs.push_back(&(*NewFArgIt));
+      liveInArgMap[passableLiveIns[I]] = &(*NewFArgIt);
+      VMap[passableLiveIns[I]] = &(*NewFArgIt++);
+    }
+    errs() << "ANDREW: splitFunction appended " << newLiveInArgs.size()
+           << " live-in args to " << newFunc->getName() << "\n";
+
+    SmallVector<ReturnInst*, 8> Returns;
+    llvm::CloneFunctionInto(newFunc, F, VMap, false, Returns);
+    if (Instruction *MappedSync = dyn_cast<Instruction>(VMap[syncInst])) {
+      errs() << "ANDREW: splitFunction removing cloned sync marker in "
+             << newFunc->getName() << ": " << *MappedSync << "\n";
+      MappedSync->eraseFromParent();
+    }
+    for (Value *OldLiveIn : passableLiveIns) {
+      auto ArgIt = liveInArgMap.find(OldLiveIn);
+      if (ArgIt == liveInArgMap.end()) continue;
+      Argument *LiveInArg = ArgIt->second;
+      auto MapIt = VMap.find(OldLiveIn);
+      if (MapIt == VMap.end()) continue;
+      Value *MappedV = MapIt->second;
+      if (!MappedV || MappedV == LiveInArg) continue;
+      Instruction *MappedI = dyn_cast<Instruction>(MappedV);
+      if (!MappedI) continue;
+      errs() << "ANDREW: splitFunction post-clone rewiring live-in "
+             << *MappedI << " -> " << *LiveInArg << "\n";
+      MappedI->replaceAllUsesWith(LiveInArg);
+    }
+    auto *newSplitBB = cast<Instruction>(*VMap[splitPoint->getTerminator()]).getParent();
+    std::set<BasicBlock*> newPostSplitRegion;
+    for (BasicBlock *OldBB : postSplitRegion) {
+      auto ItMapped = VMap.find(OldBB->getTerminator());
+      if (ItMapped == VMap.end()) continue;
+      Instruction *MappedTerm = dyn_cast<Instruction>(ItMapped->second);
+      if (!MappedTerm) continue;
+      BasicBlock *MappedBB = MappedTerm->getParent();
+      if (MappedBB) newPostSplitRegion.insert(MappedBB);
+    }
+
+    std::vector<CallInst*> createdCalls;
+    for(auto *callInst: kernelCalls[F]) {
+      if (!callInst || !callInst->getParent()) continue;
+      Builder.SetInsertPoint(callInst->getNextNode());
+      std::vector<Value*> args;
+      for(auto &arg: callInst->args()) args.push_back(arg);
+      DenseMap<Value*, Value*> liveInCache;
+      for (Value *LiveIn : passableLiveIns) {
+        Value *Resolved = materializeLiveInAtCallSite(LiveIn, callInst, Builder, liveInCache);
+        if (!Resolved)
+          Resolved = resolveLiveInAtCallSite(LiveIn, callInst);
+        if (!Resolved) {
+          errs() << "ANDREW: splitFunction live-in unresolved at callsite: "
+                 << *LiveIn << "\n";
+          continue;
+        }
+        args.push_back(Resolved);
+      }
+      CallInst *newCall = Builder.CreateCall(newFunc, args);
+      createdCalls.push_back(newCall);
+    }
+    if (!createdCalls.empty()) {
+      kernelCalls[newFunc].insert(createdCalls.begin(), createdCalls.end());
+    }
+
+    assert(!LI->getLoopFor(BB) && "The synchronization point is in a loop!!!\n");
+
+    replaceTerminatorWithReturnAndRepairPhis(BB, Builder);
+
+    std::set<BasicBlock*> prevEraseList;
+    std::set<BasicBlock*> splitEraseList;
+    prevEraseList = postSplitRegion;
+    for(auto &bb: prevEraseList) {
+      replaceTerminatorWithReturnAndRepairPhis(bb, Builder);
+    }
+
+    for (BasicBlock &CandBB : *newFunc) {
+      BasicBlock *Pred = &CandBB;
+      if (Pred == &newFunc->getEntryBlock()) continue;
+      if (!newPostSplitRegion.count(Pred))
+        splitEraseList.insert(Pred);
+    }
+    sanitizeClonedEntryBlock(&newFunc->getEntryBlock());
+    Builder.SetInsertPoint(newFunc->getEntryBlock().getTerminator());
+    Builder.CreateBr(newSplitBB);
+    newFunc->getEntryBlock().getTerminator()->eraseFromParent();
+    for(auto &bb: splitEraseList) {
+      replaceTerminatorWithReturnAndRepairPhis(bb, Builder);
+    }
+
+    bool newHasWork = hasReachableSubstantiveWork(newFunc);
+    if (postRegionHadWork && !newHasWork) {
+      errs() << "ANDREW: splitFunction WARNING: post-sync split result became trivial for "
+             << newFunc->getName() << " (source=" << F->getName() << ")\n";
+    }
+
+    return newFunc;
   }
 
   // Copied from LoopSimplify pass
@@ -1104,6 +1204,9 @@ struct MergeKernel : public ModulePass {
   }
 
   void splitLoop(LLVMContext &Context, CallInst *I, unsigned cloneNum) {
+    if (!I || !I->getParent() || cloneNum == 0)
+      return;
+
     IRBuilder<> Builder(Context);
     // Duplicate the kernel call loop
     // FIXME: Assume a 2d grid for now...
@@ -1111,14 +1214,67 @@ struct MergeKernel : public ModulePass {
     auto &LI = getAnalysis<LoopInfoWrapperPass>(*F).getLoopInfo();
     auto &DT = getAnalysis<DominatorTreeWrapperPass>(*F).getDomTree();
     auto threadLoop = LI.getLoopFor(I->getParent());
+    if (!threadLoop) {
+      errs() << "ANDREW: splitLoop skipping call not enclosed by a loop: "
+             << *I << "\n";
+      return;
+    }
+
+    // Generalized staged-loop selection:
+    // If a kernel call carries N dynamic threadIdx dimensions, clone the
+    // corresponding N-deep thread-loop nest (when present) so each fission
+    // stage gets its own full index nest instead of sharing outer loops.
+    auto isDynamicIndex = [](Value *V) -> bool {
+      if (!V) return false;
+      if (auto *CI = dyn_cast<ConstantInt>(V))
+        return CI->getSExtValue() != 0;
+      return true;
+    };
+    unsigned activeThreadDims = 0;
+    if (Function *Callee = I->getCalledFunction()) {
+      Value *tidXOp = nullptr;
+      Value *tidYOp = nullptr;
+      Value *tidZOp = nullptr;
+      unsigned maxArgs = std::min<unsigned>(I->arg_size(), Callee->arg_size());
+      for (unsigned ai = 0; ai < maxArgs; ++ai) {
+        auto argIt = Callee->arg_begin();
+        std::advance(argIt, ai);
+        StringRef argName = argIt->getName();
+        if (argName == "threadIdx.x")
+          tidXOp = I->getArgOperand(ai);
+        else if (argName == "threadIdx.y")
+          tidYOp = I->getArgOperand(ai);
+        else if (argName == "threadIdx.z")
+          tidZOp = I->getArgOperand(ai);
+      }
+      if (isDynamicIndex(tidXOp)) activeThreadDims++;
+      if (isDynamicIndex(tidYOp)) activeThreadDims++;
+      if (isDynamicIndex(tidZOp)) activeThreadDims++;
+    }
+    for (unsigned depth = 1; depth < activeThreadDims; ++depth) {
+      Loop *parentLoop = threadLoop->getParentLoop();
+      if (!parentLoop)
+        break;
+      threadLoop = parentLoop;
+    }
+
     // insert preheader if it does not exist
     if(!threadLoop->getLoopPreheader()) {
       BasicBlock *preheader = makeLoopPreheader(LI, DT, threadLoop);
-      errs() << threadLoop->getLoopPreheader()->getName() << "\n";
+      (void)preheader;
+    }
+    if (!threadLoop->getLoopPreheader()) {
+      errs() << "ANDREW: splitLoop failed to materialize loop preheader for "
+             << *I << "\n";
+      return;
     }
     // assume single predecessor of preheader (one entrance from outer loop)
     auto *entering = threadLoop->getLoopPreheader()->getSinglePredecessor();
-    assert(entering && "Not a single predecessor of preheader!!!\n");
+    if (!entering) {
+      errs() << "ANDREW: splitLoop skipping loop without single preheader predecessor: "
+             << *I << "\n";
+      return;
+    }
 
     Loop* prevLoop = threadLoop;
     for(unsigned i = 0; i < cloneNum; i++) {
@@ -1129,7 +1285,16 @@ struct MergeKernel : public ModulePass {
       remapInstructionsInBlocks(newBlocks, VMap);
       entering->getTerminator()->replaceUsesOfWith(prevLoop->getLoopPreheader(), newLoop->getLoopPreheader());
       newLoop->getHeader()->getTerminator()->replaceUsesOfWith(threadLoop->getExitBlock(), prevLoop->getLoopPreheader());
-      auto *mappedSeed = cast<Instruction>(VMap[I]);
+      auto MappedIt = VMap.find(I);
+      if (MappedIt == VMap.end()) {
+        errs() << "ANDREW: splitLoop missing mapped seed in cloned loop; skipping stage clone\n";
+        continue;
+      }
+      auto *mappedSeed = dyn_cast<Instruction>(MappedIt->second);
+      if (!mappedSeed) {
+        errs() << "ANDREW: splitLoop mapped seed is not instruction; skipping stage clone\n";
+        continue;
+      }
       std::vector<CallInst*> clonedCalls;
       for (Instruction *Scan = mappedSeed;
            Scan && Scan->getParent() == mappedSeed->getParent() &&
@@ -1188,6 +1353,28 @@ struct MergeKernel : public ModulePass {
     std::set<std::string> usedGlobalNames;
     unsigned globalsVisited = 0;
     unsigned globalsRenamed = 0;
+    // Reserve function identifiers too, because C has one namespace for
+    // functions and objects.
+    for (auto &F : M) {
+      std::string fnName = F.getName().str();
+      if (fnName.empty())
+        continue;
+
+      std::string demangledFn = demangle(fnName);
+      if (demangledFn.empty() || demangledFn == fnName)
+        demangledFn = fnName;
+
+      size_t parenPos = demangledFn.find('(');
+      if (parenPos != std::string::npos)
+        demangledFn = demangledFn.substr(0, parenPos);
+      size_t nsPos = demangledFn.rfind("::");
+      if (nsPos != std::string::npos && nsPos + 2 < demangledFn.size())
+        demangledFn = demangledFn.substr(nsPos + 2);
+
+      std::string fnBaseName = sanitizeIdentifier(demangledFn);
+      if (!fnBaseName.empty())
+        usedGlobalNames.insert(fnBaseName);
+    }
     for (auto &GV : M.globals())
       usedGlobalNames.insert(GV.getName().str());
 
@@ -2020,19 +2207,8 @@ struct MergeKernel : public ModulePass {
                      << *CI << "\n";
               continue;
             }
-            Value* originalMem = mode->isOne() ? CI->getArgOperand(1) : CI->getArgOperand(0);
-            LoadInst* originalLd = nullptr;
-            Value* originalAlloc = nullptr;
-            if(Instruction* originalBitcast = dyn_cast<BitCastInst>(originalMem)) 
-              originalLd = dyn_cast<LoadInst>(originalBitcast->getOperand(0));
-            else
-              originalLd = dyn_cast<LoadInst>(originalMem);
-            
-            if(originalLd)
-              originalAlloc = originalLd->getOperand(0);
-            else
-              originalAlloc = originalMem;
-              
+            Value *cpySize = CI->getArgOperand(2);
+            LLVMContext &C = CI->getContext();
             auto peelToBaseObject = [](Value *V) -> Value * {
               while (V) {
                 if (auto *CE = dyn_cast<ConstantExpr>(V)) {
@@ -2041,206 +2217,135 @@ struct MergeKernel : public ModulePass {
                     continue;
                   }
                 }
-
                 if (auto *BC = dyn_cast<BitCastInst>(V)) {
                   V = BC->getOperand(0);
                   continue;
                 }
-
                 if (auto *ASC = dyn_cast<AddrSpaceCastInst>(V)) {
                   V = ASC->getOperand(0);
                   continue;
                 }
-
                 if (auto *GEP = dyn_cast<GetElementPtrInst>(V)) {
                   V = GEP->getPointerOperand();
                   continue;
                 }
-
+                if (auto *LI = dyn_cast<LoadInst>(V)) {
+                  V = LI->getPointerOperand();
+                  continue;
+                }
                 break;
               }
+              return V;
+            };
+            auto serializeValueMD = [&](Value *V) -> Metadata * {
+              if (!V)
+                return MDString::get(C, "null");
+              if (auto *CIVal = dyn_cast<ConstantInt>(V))
+                return ValueAsMetadata::get(CIVal);
+              std::string S;
+              raw_string_ostream OS(S);
+              V->printAsOperand(OS, false);
+              OS.flush();
+              return MDString::get(C, S);
+            };
+            auto setCompatMapMetadata = [&](Instruction *IMap) {
+              if (!IMap)
+                return;
+              MDNode *LegacySize = nullptr;
+              if (Instruction *sizeInst = dyn_cast<Instruction>(cpySize)) {
+                LegacySize = MDNode::get(C, MDString::get(C, std::to_string(mdID)));
+                sizeInst->setMetadata("tulip.target.datasize", LegacySize);
+                mdID++;
+              }
+              MDNode *N = LegacySize
+                              ? MDNode::get(C, LegacySize)
+                              : MDNode::get(C, serializeValueMD(cpySize));
+              mode->isOne() ? IMap->setMetadata("tulip.target.mapdata.to", N)
+                            : IMap->setMetadata("tulip.target.mapdata.from", N);
+            };
 
+            Value *originalMem = mode->isOne() ? CI->getArgOperand(1) : CI->getArgOperand(0);
+            Value *devMem = mode->isOne() ? CI->getArgOperand(0) : CI->getArgOperand(1);
+            Value *originalAlloc = peelToBaseObject(originalMem);
+            Value *devAlloc = peelToBaseObject(devMem);
+
+            // New stable call-local metadata consumed by backend.
+            CI->setMetadata("tulip.cudamemcpy.direction",
+                            MDNode::get(C, MDString::get(C, mode->isOne() ? "to" : "from")));
+            CI->setMetadata("tulip.cudamemcpy.size",
+                            MDNode::get(C, serializeValueMD(cpySize)));
+            CI->setMetadata("tulip.cudamemcpy.original",
+                            MDNode::get(C, serializeValueMD(originalAlloc)));
+            CI->setMetadata("tulip.cudamemcpy.device",
+                            MDNode::get(C, serializeValueMD(devAlloc)));
+            setCompatMapMetadata(CI);
+            Type *i8PtrTy = Type::getInt8PtrTy(C);
+            Type *i64Ty = Type::getInt64Ty(C);
+            IRBuilder<> B(CI);
+            auto materializeCopyPtr = [&](Value *RawPtr) -> Value * {
+              Value *V = RawPtr;
+              while (V) {
+                if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+                  if (CE->isCast()) {
+                    V = CE->getOperand(0);
+                    continue;
+                  }
+                  if (CE->getOpcode() == Instruction::GetElementPtr) {
+                    Instruction *GepI = CE->getAsInstruction();
+                    GepI->insertBefore(CI);
+                    V = GepI;
+                  }
+                }
+                if (auto *BC = dyn_cast<BitCastInst>(V)) {
+                  V = BC->getOperand(0);
+                  continue;
+                }
+                if (auto *ASC = dyn_cast<AddrSpaceCastInst>(V)) {
+                  V = ASC->getOperand(0);
+                  continue;
+                }
+                break;
+              }
+              if (!V || !V->getType()->isPointerTy())
+                return nullptr;
+              auto *PTy = cast<PointerType>(V->getType());
+              Type *ElemTy = PTy->getElementType();
+              if (ElemTy->isPointerTy() &&
+                  (isa<AllocaInst>(V) || isa<GlobalVariable>(V) || isa<Argument>(V))) {
+                V = B.CreateLoad(ElemTy, V, "tulip.memcpy.ptr");
+              }
+              if (!V->getType()->isPointerTy())
+                return nullptr;
+              if (V->getType() != i8PtrTy)
+                V = B.CreatePointerCast(V, i8PtrTy, "tulip.memcpy.i8");
               return V;
             };
 
-            originalAlloc = peelToBaseObject(originalAlloc);
-
-
-            Value* devMem = mode->isOne() ? CI->getArgOperand(0) : CI->getArgOperand(1);
-            LoadInst* devLd = nullptr;
-            Value* devAlloc = nullptr;
-            if(Instruction* devBitcast = dyn_cast<BitCastInst>(devMem)) 
-              devLd = dyn_cast<LoadInst>(devBitcast->getOperand(0));
-            else
-              devLd = dyn_cast<LoadInst>(devMem);
-            if(devLd)
-              devAlloc = devLd->getOperand(0);
-            else
-              devAlloc = devMem;
-
-            devAlloc = peelToBaseObject(devAlloc);
-            
-            bool validOriginal = isa<AllocaInst>(originalAlloc) || isa<GlobalVariable>(originalAlloc);
-            bool validDev = isa<AllocaInst>(devAlloc) || isa<GlobalVariable>(devAlloc);
-
-            if(!validOriginal || !validDev){
-               errs() << "ANDREW: mergeKernel: invalid memory object for cudaMemcpy replacement logic\n";
-               if(originalAlloc) errs() << "Original: " << *originalAlloc << "\n";
-               if(devAlloc) errs() << "Dev: " << *devAlloc << "\n";
+            Value *srcMem = CI->getArgOperand(1);
+            Value *dstMem = CI->getArgOperand(0);
+            Value *srcPtr = materializeCopyPtr(srcMem);
+            Value *dstPtr = materializeCopyPtr(dstMem);
+            Value *size64 = cpySize;
+            if (size64->getType() != i64Ty) {
+              if (size64->getType()->isIntegerTy())
+                size64 =
+                    CastInst::CreateIntegerCast(size64, i64Ty, false, "tulip.memcpy.size.cast", CI);
+              else
+                size64 = nullptr;
             }
-
-            if(!validDev || !validOriginal){
-              errs() << "ANDREW: mergeKernel: skipping cudaMemcpy rewrite due to unsupported memory objects\n";
-              continue;
+            bool mergedEquivalent =
+                (originalAlloc && devAlloc && originalAlloc == devAlloc);
+            bool loweredLocally = false;
+            if (!mergedEquivalent && srcPtr && dstPtr && size64) {
+              B.CreateMemCpy(dstPtr, 1, srcPtr, 1, size64);
+              loweredLocally = true;
+            } else if (!mergedEquivalent) {
+              errs() << "ANDREW: mergeKernel: WARN: could not lower cudaMemcpy to local memcpy: "
+                     << *CI << "\n";
             }
-
-            Function *memcpyFunc = CI->getFunction();
-            auto isSafeMemcpyLoadRewrite = [&](LoadInst *ld) -> bool {
-              if (!ld)
-                return false;
-              Function *ldFunc = ld->getFunction();
-              if (ldFunc != memcpyFunc) {
-                // Keep alloca-backed rewrites strictly intra-function to avoid
-                // leaking stack values across function boundaries. For global-
-                // backed mappings, allow cross-function rewrites (CG uses this).
-                if (isa<AllocaInst>(originalAlloc) || isa<AllocaInst>(devAlloc)) {
-                  errs() << "mergeKernel: skipping cross-function load rewrite in cudaMemcpy: "
-                         << (ldFunc ? ldFunc->getName() : "<null>")
-                         << " vs " << (memcpyFunc ? memcpyFunc->getName() : "<null>") << "\n";
-                  return false;
-                }
-                errs() << "mergeKernel: allowing cross-function global load rewrite in cudaMemcpy: "
-                       << (ldFunc ? ldFunc->getName() : "<null>")
-                       << " vs " << (memcpyFunc ? memcpyFunc->getName() : "<null>") << "\n";
-              }
-
-              if (AllocaInst *origAlloca = dyn_cast<AllocaInst>(originalAlloc)) {
-                if (origAlloca->getFunction() != ldFunc) {
-                  errs() << "mergeKernel: skipping unsafe alloca rewrite in cudaMemcpy: alloca in "
-                         << origAlloca->getFunction()->getName()
-                         << ", load in " << (ldFunc ? ldFunc->getName() : "<null>") << "\n";
-                  return false;
-                }
-              }
-              return true;
-            };
-
-            std::vector<LoadInst*> devAllocLoadUsers;
-            for (User *user : devAlloc->users()) {
-              if (LoadInst *ld = dyn_cast<LoadInst>(user)) {
-                if (isSafeMemcpyLoadRewrite(ld))
-                  devAllocLoadUsers.push_back(ld);
-              }
-            }
-
-            // Fallback for H2D copies where source is an alloca-backed pointer
-            // argument (e.g. setup_gpu(a, c)). Cross-function load rewrites are
-            // intentionally blocked for allocas, so make the device pointer slot
-            // explicitly alias the host pointer in the memcpy function.
-            if (mode->isOne() && originalLd && isa<AllocaInst>(originalAlloc)) {
-              if (devAlloc->getType()->isPointerTy()) {
-                auto *devPtrTy = cast<PointerType>(devAlloc->getType());
-                Type *storeTy = devPtrTy->getPointerElementType();
-                if (storeTy && storeTy->isPointerTy()) {
-                  Value *srcPtr = originalLd;
-                  if (srcPtr->getType() != storeTy) {
-                    srcPtr = CastInst::CreatePointerCast(
-                        srcPtr, storeTy, "tulip.cudaMemcpy.alias.cast", CI);
-                  }
-                  new StoreInst(srcPtr, devAlloc, CI);
-                  errs() << "mergeKernel: emitted H2D pointer-alias fallback store for alloca source: "
-                         << *CI << "\n";
-                }
-              }
-            }
-            
-            if(originalLd)
-              errs() << "ANDREW: mergeKernel: originalLd " << *originalLd << "\n";
-            else
-              errs() << "ANDREW: mergeKernel: originalLd is NULL, originalMem: " << *originalMem << "\n";
-            
-            Value* cpySize = nullptr;
-            errs() << "mergeKernel: found originalAlloc " << *originalAlloc << "\n";
-            for(auto user : originalAlloc->users()){
-              if(StoreInst *st = dyn_cast<StoreInst>(user)){
-              }
-            }
-            for(auto user : originalAlloc->users()){
-              errs() << "mergeKernel: found originalAlloc user" << *user << "\n";
-              if(StoreInst *st = dyn_cast<StoreInst>(user)){
-                errs() << "mergeKernel: found originalAlloc store:" << *st << "\n";
-                if(BitCastInst* cast = dyn_cast<BitCastInst>(st->getOperand(0))){
-                  errs() << "mergeKernel: found originalAlloc cast:" << *cast << "\n";
-                  if(CallInst* ci = dyn_cast<CallInst>(cast->getOperand(0))){
-                    errs() << "mergeKernel: found originalAlloc ci:" << *ci << "\n";
-                    Function *calledCI = ci->getCalledFunction();
-                    if(!calledCI || !calledCI->getName().contains("malloc")) continue;
-                    cpySize = ci->getArgOperand(0);
-                    LLVMContext &C = cpySize->getContext();
-                    MDNode *mdSize = nullptr;
-                    if(Instruction* sizeInst = dyn_cast<Instruction>(cpySize)){
-                      std::string mdDataSize = "tulip.target.datasize";
-                      mdSize = MDNode::get(C, MDString::get(C, std::to_string(mdID)));
-                      sizeInst->setMetadata("tulip.target.datasize", mdSize);
-                      mdID++;
-                    }
-                    MDNode* N;
-                    mdSize ? N = MDNode::get(C, mdSize) :
-                             N = MDNode::get(C, ValueAsMetadata::get(dyn_cast<ConstantInt>(cpySize)));
-                    mode->isOne() ? ci->setMetadata("tulip.target.mapdata.to", N) :
-                                    ci->setMetadata("tulip.target.mapdata.from", N);
-                  }
-                }
-              }
-            }
-            // For array/pointer-backed host mappings, rewrite loads of the
-            // corresponding device pointer:
-            //  - static arrays => GEP to first element
-            //  - pointer-backed globals/allocas (CG-style) => load from host ptr slot
-            // Keep scalar/global mappings (e.g. passed_verification in IS) untouched
-            // to avoid castHost pollution.
-            Type* originalPointeeType = originalAlloc->getType()->getPointerElementType();
-            if (ArrayType *arrTy = dyn_cast<ArrayType>(originalPointeeType)) {
-              (void)arrTy;
-              for (LoadInst *ld : devAllocLoadUsers) {
-                if (ld->use_empty()) {
-                  errs() << "mergeKernel: skipping empty load during static array rewrite: " << *ld << "\n";
-                  continue;
-                }
-                Type* i64Ty = Type::getInt64Ty(ld->getContext());
-                std::vector<Value*> idxs = {
-                  ConstantInt::get(i64Ty, 0),
-                  ConstantInt::get(i64Ty, 0)
-                };
-                GetElementPtrInst* gep = GetElementPtrInst::Create(
-                  originalPointeeType,
-                  originalAlloc,
-                  idxs,
-                  "staticArrayPtr",
-                  ld
-                );
-                errs() << "mergeKernel: replacing load with GEP for static array: " << *gep << "\n";
-                ld->replaceAllUsesWith(gep);
-                ld->eraseFromParent();
-              }
-            } else if (originalPointeeType->isPointerTy()) {
-              for (LoadInst *ld : devAllocLoadUsers) {
-                if (ld->use_empty()) {
-                  errs() << "mergeKernel: skipping empty load during pointer rewrite: " << *ld << "\n";
-                  continue;
-                }
-                if (ld->getType() == originalPointeeType) {
-                  ld->setOperand(0, originalAlloc);
-                } else {
-                  auto cast = CastInst::CreatePointerCast(
-                      originalAlloc, ld->getOperand(0)->getType(), "castHost", ld);
-                  ld->setOperand(0, cast);
-                }
-              }
-            } else if (devLd) {
-              errs() << "mergeKernel: skipping scalar cudaMemcpy load rewrite: "
-                     << *devLd << "\n";
-            }
+            bool mergedSafe = mergedEquivalent || loweredLocally;
+            CI->setMetadata("tulip.cudamemcpy.merged_safe",
+                            MDNode::get(C, MDString::get(C, mergedSafe ? "true" : "false")));
 
 
 
@@ -2364,7 +2469,7 @@ struct MergeKernel : public ModulePass {
           for(auto itNum : loopDims){
             if(ConstantInt *constInt = dyn_cast<ConstantInt>(itNum))
               if(constInt->getSExtValue() == 1)
-                continue;
+              continue;
             auto header = BasicBlock::Create(kernelBB->getContext(), "header." + std::to_string(loopCnt), F, kernelBB);
             headerNests.push(header);
             header2itNum[header] = itNum;
@@ -2438,16 +2543,16 @@ struct MergeKernel : public ModulePass {
               indvar->addIncoming(ConstantInt::get(phiTy,0), nextHeader);
             }
 
-            bool mayFissionKernel = false;
-            if (kernelProfile->newFunc &&
-                syncInsts.find(kernelProfile->newFunc) != syncInsts.end() &&
-                !syncInsts[kernelProfile->newFunc].empty()) {
-              mayFissionKernel = true;
-            }
-            bool unsafeBlockCollapse =
-                mayFissionKernel || hasUnsafeBlockCollapseSemantics(kernelProfile->newFunc);
             if(kernelProfile->dim2classify[header2itNum[header]] == 1 ||
                 kernelProfile->dim2classify[header2itNum[header]] == 2){
+              bool mayFissionKernel = false;
+              if (kernelProfile->newFunc &&
+                  syncInsts.find(kernelProfile->newFunc) != syncInsts.end() &&
+                  !syncInsts[kernelProfile->newFunc].empty()) {
+                mayFissionKernel = true;
+              }
+              bool unsafeBlockCollapse =
+                  mayFissionKernel || hasUnsafeBlockCollapseSemantics(kernelProfile->newFunc);
               LLVMContext& C = term->getContext();
               MDNode* N = MDNode::get(C, MDString::get(C, ""));
               if(kernelProfile->dim2classify[header2itNum[header]] == 1){
@@ -2860,14 +2965,51 @@ struct MergeKernel : public ModulePass {
          }
      }
 
-    //Split function at synchronization points
-    for (auto [func, insts] : syncInsts) {
-      promoteKernelAllocasToSSA(func);
+    // Split function at synchronization points.
+    // Important: split iteratively using fresh marker discovery each stage.
+    // Reusing stale Instruction* markers after CFG rewrites can collapse later
+    // split stages into trivial entry->return stubs.
+    std::vector<Function*> splitSeeds;
+    splitSeeds.reserve(syncInsts.size());
+    for (auto &[func, insts] : syncInsts) {
+      if (!func || func->isDeclaration()) continue;
+      splitSeeds.push_back(func);
     }
-    for(auto [func, insts]: syncInsts) {
-      splitFunction(M.getContext(), func, insts);
-      for(auto callinst: kernelCalls[func])
-        splitLoop(M.getContext(), callinst, insts.size());
+    for (Function *func : splitSeeds) {
+      Function *current = func;
+      unsigned stage = 0;
+      while (current && !current->isDeclaration()) {
+        promoteKernelAllocasToSSA(current);
+
+        std::vector<Instruction*> markers = collectSyncMarkersInFunction(current);
+        if (markers.empty()) break;
+
+        auto KCIt = kernelCalls.find(current);
+        if (KCIt == kernelCalls.end() || KCIt->second.empty()) {
+          errs() << "ANDREW: split driver: no kernel callsites recorded for "
+                 << current->getName() << ", stopping staged split\n";
+          break;
+        }
+        std::vector<CallInst*> stageCalls(KCIt->second.begin(), KCIt->second.end());
+        // Split from the earliest reachable barrier so each stage peels
+        // pre-sync work in program order.
+        Instruction *chosenMarker = markers.front();
+        errs() << "ANDREW: split driver stage " << stage
+               << " function=" << current->getName()
+               << " markers=" << markers.size() << "\n";
+        Function *next = splitFunction(M.getContext(), current, chosenMarker,
+                                       markers.size());
+        if (!next) break;
+
+        for (CallInst *callinst : stageCalls) {
+          if (!callinst || !callinst->getParent()) continue;
+          splitLoop(M.getContext(), callinst, 1);
+        }
+        kernelCalls[current].clear();
+        syncInsts[current].clear();
+        current = next;
+        ++stage;
+      }
     }
     
     return true;
