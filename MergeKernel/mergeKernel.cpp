@@ -792,6 +792,28 @@ struct MergeKernel : public ModulePass {
     return liveIns;
   }
 
+  bool isPostRegionLocalAllocaLiveIn(Value *V, const std::set<BasicBlock*> &region) {
+    auto *AI = dyn_cast<AllocaInst>(V);
+    if (!AI) return false;
+    Function *F = AI->getFunction();
+    if (!F) return false;
+    if (AI->getParent() != &F->getEntryBlock()) return false;
+
+    for (User *U : AI->users()) {
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I) return false;
+      if (region.count(I->getParent())) continue;
+      if (isa<DbgInfoIntrinsic>(I)) continue;
+      if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+        Intrinsic::ID ID = II->getIntrinsicID();
+        if (ID == Intrinsic::lifetime_start || ID == Intrinsic::lifetime_end)
+          continue;
+      }
+      return false;
+    }
+    return true;
+  }
+
   Value *resolveLiveInAtCallSite(Value *LiveIn, CallInst *CallI) {
     if (Argument *A = dyn_cast<Argument>(LiveIn))
       return CallI->getArgOperand(A->getArgNo());
@@ -800,13 +822,37 @@ struct MergeKernel : public ModulePass {
     return nullptr;
   }
 
+  bool isSafeInvariantLoadForLiveIn(LoadInst *LI) {
+    if (!LI) return false;
+    if (LI->isVolatile() || LI->isAtomic()) return false;
+    Value *Ptr = LI->getPointerOperand()->stripPointerCasts();
+    auto *GV = dyn_cast<GlobalVariable>(Ptr);
+    if (!GV) return false;
+    if (GV->isConstant()) return true;
+    // CUDA constant-memory globals are typically addrspace(4); allow these
+    // as immutable live-ins even when not marked constant in IR.
+    if (GV->getAddressSpace() == 4) return true;
+    return false;
+  }
+
   bool canMaterializeLiveIn(Value *V, DenseSet<Value*> &visiting) {
     if (!V) return false;
     if (isa<Argument>(V) || isa<Constant>(V) || isa<GlobalValue>(V))
       return true;
     auto *I = dyn_cast<Instruction>(V);
     if (!I) return false;
-    if (isa<PHINode>(I) || isa<AllocaInst>(I) || isa<LoadInst>(I) ||
+    if (auto *LI = dyn_cast<LoadInst>(I)) {
+      if (!isSafeInvariantLoadForLiveIn(LI))
+        return false;
+      if (!visiting.insert(V).second) return false;
+      if (!canMaterializeLiveIn(LI->getPointerOperand(), visiting)) {
+        visiting.erase(V);
+        return false;
+      }
+      visiting.erase(V);
+      return true;
+    }
+    if (isa<PHINode>(I) || isa<AllocaInst>(I) ||
         isa<StoreInst>(I) || isa<CallInst>(I))
       return false;
     if (!visiting.insert(V).second) return false;
@@ -836,6 +882,15 @@ struct MergeKernel : public ModulePass {
       return materializeLiveInAtCallSite(Op, CallI, B, cache);
     };
 
+    if (auto *LI = dyn_cast<LoadInst>(I)) {
+      if (!isSafeInvariantLoadForLiveIn(LI))
+        return nullptr;
+      Value *Ptr = matOp(LI->getPointerOperand());
+      if (!Ptr) return nullptr;
+      auto *NewLoad = B.CreateLoad(LI->getType(), Ptr, "livein.mat");
+      NewLoad->setAlignment(LI->getAlignment());
+      return cache[V] = NewLoad;
+    }
     if (auto *BO = dyn_cast<BinaryOperator>(I)) {
       Value *L = matOp(BO->getOperand(0));
       Value *R = matOp(BO->getOperand(1));
@@ -1012,14 +1067,174 @@ struct MergeKernel : public ModulePass {
     return false;
   }
 
+  bool hasReachableReturnBeforeSync(Function *F, Instruction *syncInst,
+                                    DominatorTree &DT) {
+    if (!F || !syncInst || syncInst->getFunction() != F) return true;
+
+    SmallVector<BasicBlock*, 16> worklist;
+    SmallPtrSet<BasicBlock*, 32> reachable;
+    worklist.push_back(&F->getEntryBlock());
+    while (!worklist.empty()) {
+      BasicBlock *BB = worklist.pop_back_val();
+      if (!reachable.insert(BB).second) continue;
+      for (BasicBlock *Succ : successors(BB))
+        worklist.push_back(Succ);
+    }
+
+    if (!reachable.count(syncInst->getParent()))
+      return true;
+
+    for (BasicBlock &BB : *F) {
+      if (!reachable.count(&BB)) continue;
+      auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
+      if (!RI) continue;
+      if (!DT.dominates(syncInst, RI))
+        return true;
+    }
+    return false;
+  }
+
+  bool canReachBlock(BasicBlock *Start, BasicBlock *Target) {
+    if (!Start || !Target) return false;
+    if (Start == Target) return true;
+    SmallVector<BasicBlock*, 16> worklist;
+    SmallPtrSet<BasicBlock*, 32> visited;
+    worklist.push_back(Start);
+    while (!worklist.empty()) {
+      BasicBlock *BB = worklist.pop_back_val();
+      if (!visited.insert(BB).second) continue;
+      for (BasicBlock *Succ : successors(BB)) {
+        if (Succ == Target) return true;
+        worklist.push_back(Succ);
+      }
+    }
+    return false;
+  }
+
+  bool canReachReturnBeforeSync(BasicBlock *Start, Instruction *syncInst,
+                                DominatorTree &DT) {
+    if (!Start || !syncInst) return false;
+    SmallVector<BasicBlock*, 16> worklist;
+    SmallPtrSet<BasicBlock*, 32> visited;
+    worklist.push_back(Start);
+    while (!worklist.empty()) {
+      BasicBlock *BB = worklist.pop_back_val();
+      if (!visited.insert(BB).second) continue;
+      if (auto *RI = dyn_cast<ReturnInst>(BB->getTerminator())) {
+        if (!DT.dominates(syncInst, RI))
+          return true;
+      }
+      for (BasicBlock *Succ : successors(BB))
+        worklist.push_back(Succ);
+    }
+    return false;
+  }
+
+  bool findEarlyExitGuardBranch(Function *F, Instruction *syncInst, DominatorTree &DT,
+                                BranchInst *&GuardBr, bool &guardTrueMeansReachedSync) {
+    GuardBr = nullptr;
+    guardTrueMeansReachedSync = true;
+    if (!F || !syncInst || !syncInst->getParent()) return false;
+    BasicBlock *syncBB = syncInst->getParent();
+
+    SmallVector<BasicBlock*, 16> worklist;
+    SmallPtrSet<BasicBlock*, 32> reachable;
+    worklist.push_back(&F->getEntryBlock());
+    while (!worklist.empty()) {
+      BasicBlock *BB = worklist.pop_back_val();
+      if (!reachable.insert(BB).second) continue;
+      for (BasicBlock *Succ : successors(BB))
+        worklist.push_back(Succ);
+    }
+
+    for (BasicBlock *BB : reachable) {
+      auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
+      if (!BI || !BI->isConditional()) continue;
+      if (!DT.dominates(BI, syncInst)) continue;
+
+      BasicBlock *TrueBB = BI->getSuccessor(0);
+      BasicBlock *FalseBB = BI->getSuccessor(1);
+      bool trueCanReachSync = canReachBlock(TrueBB, syncBB);
+      bool falseCanReachSync = canReachBlock(FalseBB, syncBB);
+      if (trueCanReachSync == falseCanReachSync) continue;
+
+      bool trueCanEarlyReturn = canReachReturnBeforeSync(TrueBB, syncInst, DT);
+      bool falseCanEarlyReturn = canReachReturnBeforeSync(FalseBB, syncInst, DT);
+      bool thisTrueMeansReachedSync = false;
+      bool matchesPattern = false;
+      if (trueCanReachSync && falseCanEarlyReturn && !falseCanReachSync) {
+        thisTrueMeansReachedSync = true;
+        matchesPattern = true;
+      } else if (falseCanReachSync && trueCanEarlyReturn && !trueCanReachSync) {
+        thisTrueMeansReachedSync = false;
+        matchesPattern = true;
+      }
+      if (!matchesPattern) continue;
+
+      if (GuardBr && GuardBr != BI)
+        return false;
+      GuardBr = BI;
+      guardTrueMeansReachedSync = thisTrueMeansReachedSync;
+    }
+    return GuardBr != nullptr;
+  }
+
   Function *splitFunction(LLVMContext &Context, Function* F, Instruction *syncInst,
-                          unsigned splitIndex) {
+                          unsigned splitIndex,
+                          bool *usedReachedSyncGuard = nullptr) {
     IRBuilder<> Builder(Context);
     if (!F || !syncInst) return nullptr;
     if (syncInst->getFunction() != F || !isBarrierMarkerInst(syncInst)) {
       errs() << "ANDREW: splitFunction skipped invalid sync marker in "
              << F->getName() << "\n";
       return nullptr;
+    }
+    auto &DT = getAnalysis<DominatorTreeWrapperPass>(*F).getDomTree();
+    bool enableReachedSyncCallsiteGuard = false;
+    if (usedReachedSyncGuard)
+      *usedReachedSyncGuard = false;
+    BranchInst *earlyExitGuardBr = nullptr;
+    bool guardTrueMeansReachedSync = true;
+    if (hasReachableReturnBeforeSync(F, syncInst, DT)) {
+      if (!F->getReturnType()->isVoidTy()) {
+        errs() << "ANDREW: splitFunction skip unsafe split for " << F->getName()
+               << " due to reachable return before sync marker on non-void function\n";
+        return nullptr;
+      }
+      auto KCIt = kernelCalls.find(F);
+      if (KCIt == kernelCalls.end() || KCIt->second.empty()) {
+        errs() << "ANDREW: splitFunction skip unsafe split for " << F->getName()
+               << " due to missing callsites for reached_sync guard\n";
+        return nullptr;
+      }
+      if (!findEarlyExitGuardBranch(F, syncInst, DT, earlyExitGuardBr,
+                                    guardTrueMeansReachedSync)) {
+        errs() << "ANDREW: splitFunction skip unsafe split for " << F->getName()
+               << " due to non-canonical early-return control flow\n";
+        return nullptr;
+      }
+      DenseSet<Value*> visiting;
+      Value *GuardCond = earlyExitGuardBr->getCondition();
+      if (!(isa<Argument>(GuardCond) || isa<Constant>(GuardCond) ||
+            isa<GlobalValue>(GuardCond) || canMaterializeLiveIn(GuardCond, visiting))) {
+        errs() << "ANDREW: splitFunction skip unsafe split for " << F->getName()
+               << " due to non-materializable early-return guard\n";
+        return nullptr;
+      }
+      for (CallInst *CallI : KCIt->second) {
+        if (!CallI || !CallI->getParent()) {
+          errs() << "ANDREW: splitFunction skip unsafe split for " << F->getName()
+                 << " due to unsupported callsite for reached_sync guard\n";
+          return nullptr;
+        }
+      }
+      enableReachedSyncCallsiteGuard = true;
+      if (usedReachedSyncGuard)
+        *usedReachedSyncGuard = true;
+      errs() << "ANDREW: splitFunction early-exit aware split enabled for "
+             << F->getName() << " via guard branch in "
+             << earlyExitGuardBr->getParent()->getName()
+             << "\n";
     }
 
     auto *BB = syncInst->getParent();
@@ -1028,13 +1243,26 @@ struct MergeKernel : public ModulePass {
     std::set<BasicBlock*> postSplitRegion = collectPostSplitRegion(splitPoint);
     std::vector<Value*> liveIns = collectPostSplitLiveIns(F, postSplitRegion);
     std::vector<Value*> passableLiveIns;
+    unsigned unresolvedLiveIns = 0;
     for (Value *V : liveIns) {
       DenseSet<Value*> visiting;
+      if (isPostRegionLocalAllocaLiveIn(V, postSplitRegion)) {
+        errs() << "ANDREW: splitFunction ignoring post-region local alloca live-in: "
+               << *V << "\n";
+        continue;
+      }
       if (isa<Argument>(V) || isa<Constant>(V) || isa<GlobalValue>(V) ||
           canMaterializeLiveIn(V, visiting))
         passableLiveIns.push_back(V);
-      else
+      else {
+        ++unresolvedLiveIns;
         errs() << "ANDREW: splitFunction unresolved instruction live-in: " << *V << "\n";
+      }
+    }
+    if (unresolvedLiveIns != 0) {
+      errs() << "ANDREW: splitFunction skip unsafe split for " << F->getName()
+             << " due to unresolved live-ins=" << unresolvedLiveIns << "\n";
+      return nullptr;
     }
     errs() << "ANDREW: splitFunction discovered live-ins=" << liveIns.size()
            << ", passable live-ins=" << passableLiveIns.size() << "\n";
@@ -1058,6 +1286,8 @@ struct MergeKernel : public ModulePass {
     std::vector<Type*> newParamTypes;
     for (auto &Arg : F->args()) newParamTypes.push_back(Arg.getType());
     for (Value *V : passableLiveIns) newParamTypes.push_back(V->getType());
+    if (enableReachedSyncCallsiteGuard)
+      newParamTypes.push_back(Type::getInt1Ty(Context));
     FunctionType *newFuncTy =
         FunctionType::get(F->getReturnType(), newParamTypes, F->isVarArg());
 
@@ -1088,6 +1318,11 @@ struct MergeKernel : public ModulePass {
       newLiveInArgs.push_back(&(*NewFArgIt));
       liveInArgMap[passableLiveIns[I]] = &(*NewFArgIt);
       VMap[passableLiveIns[I]] = &(*NewFArgIt++);
+    }
+    Argument *reachedSyncArg = nullptr;
+    if (enableReachedSyncCallsiteGuard) {
+      NewFArgIt->setName("livein.reached_sync");
+      reachedSyncArg = &(*NewFArgIt++);
     }
     errs() << "ANDREW: splitFunction appended " << newLiveInArgs.size()
            << " live-in args to " << newFunc->getName() << "\n";
@@ -1125,9 +1360,14 @@ struct MergeKernel : public ModulePass {
     }
 
     std::vector<CallInst*> createdCalls;
-    for(auto *callInst: kernelCalls[F]) {
+    for (auto *callInst : kernelCalls[F]) {
       if (!callInst || !callInst->getParent()) continue;
-      Builder.SetInsertPoint(callInst->getNextNode());
+      Instruction *InsertPt = callInst->getNextNode();
+      if (!InsertPt) {
+        errs() << "ANDREW: splitFunction live-in unresolved at callsite: missing insert point\n";
+        continue;
+      }
+      Builder.SetInsertPoint(InsertPt);
       std::vector<Value*> args;
       for(auto &arg: callInst->args()) args.push_back(arg);
       DenseMap<Value*, Value*> liveInCache;
@@ -1142,8 +1382,34 @@ struct MergeKernel : public ModulePass {
         }
         args.push_back(Resolved);
       }
-      CallInst *newCall = Builder.CreateCall(newFunc, args);
-      createdCalls.push_back(newCall);
+      if (enableReachedSyncCallsiteGuard) {
+        DenseMap<Value*, Value*> guardCache;
+        Value *GuardCond = materializeLiveInAtCallSite(
+            earlyExitGuardBr->getCondition(), callInst, Builder, guardCache);
+        if (!GuardCond)
+          GuardCond = resolveLiveInAtCallSite(earlyExitGuardBr->getCondition(), callInst);
+        if (!GuardCond || !GuardCond->getType()->isIntegerTy(1)) {
+          errs() << "ANDREW: splitFunction live-in unresolved at callsite: reached_sync guard build failed\n";
+          continue;
+        }
+        Value *ReachedSync = guardTrueMeansReachedSync
+                                 ? GuardCond
+                                 : Builder.CreateXor(
+                                       GuardCond,
+                                       ConstantInt::get(GuardCond->getType(), 1),
+                                       "mk.reached.sync");
+        args.push_back(ReachedSync);
+        CallInst *newCall = Builder.CreateCall(newFunc, args);
+        createdCalls.push_back(newCall);
+        errs() << "ANDREW: splitFunction passed reached_sync live-in for "
+               << F->getName() << "\n";
+      } else {
+        // Keep insertion order stable: live-in materialization for this callsite
+        // has already been emitted at InsertPt, so emit the staged call in the
+        // same insertion stream to preserve dominance.
+        CallInst *newCall = Builder.CreateCall(newFunc, args);
+        createdCalls.push_back(newCall);
+      }
     }
     if (!createdCalls.empty()) {
       kernelCalls[newFunc].insert(createdCalls.begin(), createdCalls.end());
@@ -1167,9 +1433,30 @@ struct MergeKernel : public ModulePass {
         splitEraseList.insert(Pred);
     }
     sanitizeClonedEntryBlock(&newFunc->getEntryBlock());
-    Builder.SetInsertPoint(newFunc->getEntryBlock().getTerminator());
-    Builder.CreateBr(newSplitBB);
-    newFunc->getEntryBlock().getTerminator()->eraseFromParent();
+    if (enableReachedSyncCallsiteGuard && reachedSyncArg) {
+      BasicBlock *entryBB = &newFunc->getEntryBlock();
+      BasicBlock *guardContinueBB =
+          BasicBlock::Create(Context, "mk.guard.cont", newFunc, newSplitBB);
+      BasicBlock *guardReturnBB =
+          BasicBlock::Create(Context, "mk.guard.ret", newFunc, newSplitBB);
+
+      IRBuilder<> GuardBuilder(entryBB->getTerminator());
+      GuardBuilder.CreateCondBr(reachedSyncArg, guardContinueBB, guardReturnBB);
+      entryBB->getTerminator()->eraseFromParent();
+
+      IRBuilder<> ContinueBuilder(guardContinueBB);
+      ContinueBuilder.CreateBr(newSplitBB);
+
+      IRBuilder<> ReturnBuilder(guardReturnBB);
+      if (newFunc->getReturnType()->isVoidTy())
+        ReturnBuilder.CreateRetVoid();
+      else
+        ReturnBuilder.CreateRet(UndefValue::get(newFunc->getReturnType()));
+    } else {
+      Builder.SetInsertPoint(newFunc->getEntryBlock().getTerminator());
+      Builder.CreateBr(newSplitBB);
+      newFunc->getEntryBlock().getTerminator()->eraseFromParent();
+    }
     for(auto &bb: splitEraseList) {
       replaceTerminatorWithReturnAndRepairPhis(bb, Builder);
     }
@@ -1201,6 +1488,15 @@ struct MergeKernel : public ModulePass {
     DT.splitBlock(preheader);
 
     return preheader;
+  }
+
+  bool loopContainsEarlyReturn(Loop *L) {
+    if (!L) return false;
+    for (BasicBlock *BB : L->blocks()) {
+      if (isa<ReturnInst>(BB->getTerminator()))
+        return true;
+    }
+    return false;
   }
 
   void splitLoop(LLVMContext &Context, CallInst *I, unsigned cloneNum) {
@@ -1256,6 +1552,11 @@ struct MergeKernel : public ModulePass {
       if (!parentLoop)
         break;
       threadLoop = parentLoop;
+    }
+    if (loopContainsEarlyReturn(threadLoop)) {
+      errs() << "ANDREW: splitLoop skipping loop fission due to in-loop return: "
+             << *I << "\n";
+      return;
     }
 
     // insert preheader if it does not exist
@@ -2991,14 +3292,31 @@ struct MergeKernel : public ModulePass {
           break;
         }
         std::vector<CallInst*> stageCalls(KCIt->second.begin(), KCIt->second.end());
-        // Split from the earliest reachable barrier so each stage peels
-        // pre-sync work in program order.
-        Instruction *chosenMarker = markers.front();
+        auto &CurrentLI = getAnalysis<LoopInfoWrapperPass>(*current).getLoopInfo();
+        // Split from the earliest reachable non-loop barrier so each stage peels
+        // pre-sync work in program order while avoiding loop-carried markers.
+        Instruction *chosenMarker = nullptr;
+        for (Instruction *marker : markers) {
+          if (!marker || !marker->getParent()) continue;
+          if (!CurrentLI.getLoopFor(marker->getParent())) {
+            chosenMarker = marker;
+            break;
+          }
+        }
+        if (!chosenMarker) {
+          errs() << "ANDREW: split driver stage " << stage
+                 << " function=" << current->getName()
+                 << " no non-loop marker -> skip staged split/fission for this function\n";
+          kernelCalls[current].clear();
+          syncInsts[current].clear();
+          break;
+        }
         errs() << "ANDREW: split driver stage " << stage
                << " function=" << current->getName()
                << " markers=" << markers.size() << "\n";
+        bool usedReachedSyncGuard = false;
         Function *next = splitFunction(M.getContext(), current, chosenMarker,
-                                       markers.size());
+                                       markers.size(), &usedReachedSyncGuard);
         if (!next) break;
 
         for (CallInst *callinst : stageCalls) {
