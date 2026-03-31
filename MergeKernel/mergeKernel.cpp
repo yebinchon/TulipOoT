@@ -1,3 +1,4 @@
+#include "SeparateDeepFissionMode.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -563,6 +564,87 @@ struct MergeKernel : public ModulePass {
            << " inlined exp(s) with exp() calls and cleaned up dead blocks\n";
   }
 
+  void recordDimValues(KernelProfile *kernelProfile, Value *DimValues[3], bool isBlockDim) {
+    bool classifiedPrimaryDim = false;
+    for (unsigned I = 0; I < 3; ++I) {
+      Value *dim = DimValues[I];
+      if (!dim) continue;
+
+      bool isOne = false;
+      if (ConstantInt *constInt = dyn_cast<ConstantInt>(dim))
+        if (constInt->getSExtValue() == 1)
+          isOne = true;
+
+      kernelProfile->loopDims.push_back(dim);
+      if (isBlockDim) {
+        if (!isOne) kernelProfile->blockLoopCnt++;
+        if (!isOne && !classifiedPrimaryDim) {
+          kernelProfile->dim2classify[dim] = 2;
+          classifiedPrimaryDim = true;
+        } else {
+          kernelProfile->dim2classify[dim] = 0;
+        }
+      } else {
+        if (!isOne) kernelProfile->gridLoopCnt++;
+        if (!isOne && !classifiedPrimaryDim) {
+          kernelProfile->dim2classify[dim] = 1;
+          classifiedPrimaryDim = true;
+        } else {
+          kernelProfile->dim2classify[dim] = 0;
+        }
+      }
+
+      errs() << "mergeKernel: Dim " << (I + 1) << " : " << *dim << "\n";
+    }
+  }
+
+  bool collectDimValuesFromStores(AllocaInst *DimAlloca, Instruction *BeforeI,
+                                  Value *DimValues[3]) {
+    if (!DimAlloca || !BeforeI) return false;
+
+    auto decodeDimField = [&](Value *Ptr, unsigned &FieldIdx) -> bool {
+      auto *GEP = dyn_cast<GEPOperator>(Ptr);
+      if (!GEP) return false;
+      if (GEP->getNumIndices() != 2) return false;
+
+      Value *Base = GEP->getPointerOperand()->stripPointerCasts();
+      if (Base != DimAlloca) return false;
+
+      auto IdxIt = GEP->idx_begin();
+      auto *ZeroIdx = dyn_cast<ConstantInt>(IdxIt->get());
+      ++IdxIt;
+      auto *FieldConst = dyn_cast<ConstantInt>(IdxIt->get());
+      if (!ZeroIdx || !ZeroIdx->isZero() || !FieldConst) return false;
+
+      uint64_t Field = FieldConst->getZExtValue();
+      if (Field > 2) return false;
+      FieldIdx = static_cast<unsigned>(Field);
+      return true;
+    };
+
+    for (unsigned I = 0; I < 3; ++I)
+      DimValues[I] = nullptr;
+
+    bool Found[3] = {false, false, false};
+    BasicBlock *BB = BeforeI->getParent();
+    for (auto It = BeforeI->getIterator(); It != BB->begin();) {
+      --It;
+      auto *SI = dyn_cast<StoreInst>(&*It);
+      if (!SI) continue;
+
+      unsigned FieldIdx = 0;
+      if (!decodeDimField(SI->getPointerOperand(), FieldIdx)) continue;
+      if (Found[FieldIdx]) continue;
+
+      DimValues[FieldIdx] = SI->getValueOperand();
+      Found[FieldIdx] = true;
+      if (Found[0] && Found[1] && Found[2])
+        return true;
+    }
+
+    return false;
+  }
+
   void findThreadDim(KernelProfile *kernelProfile, Function &F, LoadInst *DimArg, bool isBlockDim){
     //LoadInst *DimArg = dyn_cast<LoadInst>(CI->getArgOperand(2));
     assert(DimArg && "mergeKernel: DimArg is not a load inst\n");
@@ -580,6 +662,7 @@ struct MergeKernel : public ModulePass {
     }
     assert(CoerceBitCast && "mergeKernel: CoerceBitCast is not a bit cast inst\n");
     BitCastInst *AggBitCast = nullptr;
+    CallInst *CoerceMemcpy = nullptr;
     for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
       CallInst *CI = dyn_cast<CallInst>(&*I);
       if(!CI) continue;
@@ -589,12 +672,19 @@ struct MergeKernel : public ModulePass {
       if(CI->getArgOperand(0) != CoerceBitCast) continue;
       BitCastInst *bitcast = dyn_cast<BitCastInst>(CI->getArgOperand(1));
       AggBitCast = bitcast;
+      CoerceMemcpy = CI;
       break;
     }
     assert(AggBitCast && "mergeKernel: AggMemcpy not found \n");
     AllocaInst *AggAlloca = dyn_cast<AllocaInst>(AggBitCast->getOperand(0));
     assert(AggAlloca && "mergeKernel: gridDimAlloca is not an alloca inst \n");
-    bool foundDim = false;
+
+    Value *DimValues[3] = {nullptr, nullptr, nullptr};
+    if (collectDimValuesFromStores(AggAlloca, CoerceMemcpy, DimValues)) {
+      recordDimValues(kernelProfile, DimValues, isBlockDim);
+      return;
+    }
+
     for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
       CallInst *CI = dyn_cast<CallInst>(&*I);
       if(!CI) continue;
@@ -602,103 +692,65 @@ struct MergeKernel : public ModulePass {
       if(!called) continue;
       if(!called->getName().contains("_ZN4dim3C2Ejjj")) continue;
       if(CI->getArgOperand(0) != AggAlloca) continue;
+      Value *CtorDims[3] = {
+        CI->getArgOperand(1),
+        CI->getArgOperand(2),
+        CI->getArgOperand(3)
+      };
+      recordDimValues(kernelProfile, CtorDims, isBlockDim);
+      return;
+    }
 
-      bool classifiedPrimaryDim = false;
-      for(int i=1; i<=3; ++i){
-        Value *dim = CI->getArgOperand(i);
-        bool isOne = false;
-        if(ConstantInt *constInt = dyn_cast<ConstantInt>(dim))
-          if(constInt->getSExtValue() == 1)
-            isOne = true;
-        kernelProfile->loopDims.push_back(dim);
-        if(isBlockDim){
-          if(!isOne) kernelProfile->blockLoopCnt ++;
-          if(!isOne && !classifiedPrimaryDim){
-            kernelProfile->dim2classify[dim] = 2;
-            classifiedPrimaryDim = true;
-          } else {
-            kernelProfile->dim2classify[dim] = 0;
-          }
-        }
-        else{
-          if(!isOne) kernelProfile->gridLoopCnt ++;
-          if(!isOne && !classifiedPrimaryDim){
-            kernelProfile->dim2classify[dim] = 1;
-            classifiedPrimaryDim = true;
-          } else {
-            kernelProfile->dim2classify[dim] = 0;
-          }
-        }
-
-        errs() << "mergeKernel: Dim " << i << " : " << *dim <<"\n";
-      }
-
-
-      foundDim = true;
+    BitCastInst *AggBitCast2 = nullptr;
+    for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
+      BitCastInst *bitcast = dyn_cast<BitCastInst>(&*I);
+      if(!bitcast) continue;
+      if(bitcast->getOperand(0) != AggAlloca) continue;
+      AggBitCast2 = bitcast;
       break;
     }
-    if(!foundDim){
-      BitCastInst *AggBitCast2 = nullptr;
-      for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
-        BitCastInst *bitcast = dyn_cast<BitCastInst>(&*I);
-        if(!bitcast) continue;
-        if(bitcast->getOperand(0) != AggAlloca) continue;
-        AggBitCast2 = bitcast;
-        break;
-      }
-      assert(AggBitCast2 && "mergeKernel: AggBitCast2 is not found \n");
-      BitCastInst *DimBitCast = nullptr;
-      for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
-        CallInst *CI = dyn_cast<CallInst>(&*I);
-        if(!CI) continue;
-        Function *called = CI->getCalledFunction();
-        if(!called) continue;
-        if(called->getName() != "llvm.memcpy.p0i8.p0i8.i64") continue;
-        if(CI->getArgOperand(0) != AggBitCast2) continue;
-        BitCastInst *bitcast = dyn_cast<BitCastInst>(CI->getArgOperand(1));
-        DimBitCast = bitcast;
-        break;
-      }
-      AllocaInst *DimAlloca = dyn_cast<AllocaInst>(DimBitCast->getOperand(0));
-      assert(DimAlloca && "mergeKernel: DimAlloca is not found \n");
-      for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
-        CallInst *CI = dyn_cast<CallInst>(&*I);
-        if(!CI) continue;
-        Function *called = CI->getCalledFunction();
-        if(!called) continue;
-        if(!called->getName().contains("_ZN4dim3C2Ejjj")) continue;
-        if(CI->getArgOperand(0) != DimAlloca) continue;
-        bool classifiedPrimaryDim = false;
-        for(int i=1; i<=3; ++i){
-          Value *dim = CI->getArgOperand(i);
-          bool isOne = false;
-          if(ConstantInt *constInt = dyn_cast<ConstantInt>(dim))
-            if(constInt->getSExtValue() == 1)
-              isOne = true;
-          kernelProfile->loopDims.push_back(dim);
-          if(isBlockDim){
-            if(!isOne) kernelProfile->blockLoopCnt ++;
-            if(!isOne && !classifiedPrimaryDim){
-              kernelProfile->dim2classify[dim] = 2;
-              classifiedPrimaryDim = true;
-            } else {
-              kernelProfile->dim2classify[dim] = 0;
-            }
-          }
-          else{
-            if(!isOne) kernelProfile->gridLoopCnt ++;
-            if(!isOne && !classifiedPrimaryDim){
-              kernelProfile->dim2classify[dim] = 1;
-              classifiedPrimaryDim = true;
-            } else {
-              kernelProfile->dim2classify[dim] = 0;
-            }
-          }
-        }
-        foundDim = true;
-        break;
-      }
+    assert(AggBitCast2 && "mergeKernel: AggBitCast2 is not found \n");
+    BitCastInst *DimBitCast = nullptr;
+    CallInst *DimMemcpy = nullptr;
+    for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
+      CallInst *CI = dyn_cast<CallInst>(&*I);
+      if(!CI) continue;
+      Function *called = CI->getCalledFunction();
+      if(!called) continue;
+      if(called->getName() != "llvm.memcpy.p0i8.p0i8.i64") continue;
+      if(CI->getArgOperand(0) != AggBitCast2) continue;
+      BitCastInst *bitcast = dyn_cast<BitCastInst>(CI->getArgOperand(1));
+      DimBitCast = bitcast;
+      DimMemcpy = CI;
+      break;
     }
+    AllocaInst *DimAlloca = dyn_cast<AllocaInst>(DimBitCast->getOperand(0));
+    assert(DimAlloca && "mergeKernel: DimAlloca is not found \n");
+
+    if (collectDimValuesFromStores(DimAlloca, DimMemcpy, DimValues)) {
+      recordDimValues(kernelProfile, DimValues, isBlockDim);
+      return;
+    }
+
+    for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
+      CallInst *CI = dyn_cast<CallInst>(&*I);
+      if(!CI) continue;
+      Function *called = CI->getCalledFunction();
+      if(!called) continue;
+      if(!called->getName().contains("_ZN4dim3C2Ejjj")) continue;
+      if(CI->getArgOperand(0) != DimAlloca) continue;
+      Value *CtorDims[3] = {
+        CI->getArgOperand(1),
+        CI->getArgOperand(2),
+        CI->getArgOperand(3)
+      };
+      recordDimValues(kernelProfile, CtorDims, isBlockDim);
+      return;
+    }
+
+    errs() << "mergeKernel: WARN: failed to recover dim3 values for "
+           << (isBlockDim ? "threadSize" : "blockSize") << " in function "
+           << F.getName() << "\n";
   }
 
   void eraseBasicBlockRegion(Function *Func, const std::set<BasicBlock*> &eraseList) {
@@ -2372,54 +2424,45 @@ struct MergeKernel : public ModulePass {
                 size64 = ConstantInt::get(i64Ty, 0);
             }
 
-            // Only lower full-symbol writes (offset 0, size == sizeof(symbol)).
+            // Lower constant-range symbol writes when they are in-bounds:
+            //   copy [offset, offset+size) from src into dst symbol bytes.
             ConstantInt *offImm = dyn_cast<ConstantInt>(offset64);
             ConstantInt *sizeImm = dyn_cast<ConstantInt>(size64);
-            if (!offImm || !offImm->isZero() || !sizeImm) {
-              errs() << "mergeKernel: WARN: unsupported non-full cudaMemcpyToSymbol, keeping call: "
+            if (!offImm || !sizeImm) {
+              errs() << "mergeKernel: WARN: non-constant cudaMemcpyToSymbol offset/size, keeping call: "
                      << *CI << "\n";
               continue;
             }
             Type *dstElemTy = dstPtrTy->getPointerElementType();
             const DataLayout &DL = F->getParent()->getDataLayout();
             uint64_t dstElemSize = DL.getTypeStoreSize(dstElemTy);
-            if (sizeImm->getZExtValue() != dstElemSize) {
-              errs() << "mergeKernel: WARN: cudaMemcpyToSymbol size does not match symbol size, keeping call: "
+            uint64_t offBytes = offImm->getZExtValue();
+            uint64_t copyBytes = sizeImm->getZExtValue();
+            if (offBytes > dstElemSize || copyBytes > dstElemSize - offBytes) {
+              errs() << "mergeKernel: WARN: cudaMemcpyToSymbol range out of bounds, keeping call: "
                      << *CI << "\n";
               continue;
             }
-            if (dstElemTy->isAggregateType()) {
-              Type *dstBytePtrTy = Type::getInt8PtrTy(C, dstPtrTy->getAddressSpace());
-              Type *srcBytePtrTy = Type::getInt8PtrTy(C, srcPtrTy->getAddressSpace());
-              Value *dstBytes = dstSymbol;
-              Value *srcBytes = srcPtr;
-              if (dstBytes->getType() != dstBytePtrTy)
-                dstBytes = CastInst::CreatePointerCast(
-                    dstBytes, dstBytePtrTy, "tulip.sym.dst.byte.cast", CI);
-              if (srcBytes->getType() != srcBytePtrTy)
-                srcBytes = CastInst::CreatePointerCast(
-                    srcBytes, srcBytePtrTy, "tulip.sym.src.byte.cast", CI);
+            Type *dstBytePtrTy = Type::getInt8PtrTy(C, dstPtrTy->getAddressSpace());
+            Type *srcBytePtrTy = Type::getInt8PtrTy(C, srcPtrTy->getAddressSpace());
+            Value *dstBytes = dstSymbol;
+            Value *srcBytes = srcPtr;
+            if (dstBytes->getType() != dstBytePtrTy)
+              dstBytes = CastInst::CreatePointerCast(
+                  dstBytes, dstBytePtrTy, "tulip.sym.dst.byte.cast", CI);
+            if (srcBytes->getType() != srcBytePtrTy)
+              srcBytes = CastInst::CreatePointerCast(
+                  srcBytes, srcBytePtrTy, "tulip.sym.src.byte.cast", CI);
 
-              uint64_t copyBytes = sizeImm->getZExtValue();
-              for (uint64_t b = 0; b < copyBytes; ++b) {
-                Value *idx = ConstantInt::get(i64Ty, b);
-                Value *dstByte = GetElementPtrInst::Create(
-                    i8Ty, dstBytes, {idx}, "tulip.sym.dst.byte", CI);
-                Value *srcByte = GetElementPtrInst::Create(
-                    i8Ty, srcBytes, {idx}, "tulip.sym.src.byte", CI);
-                auto *loadedByte = new LoadInst(i8Ty, srcByte, "tulip.sym.byte.ld", CI);
-                new StoreInst(loadedByte, dstByte, CI);
-              }
-            } else {
-              Type *srcTypedPtrTy =
-                  PointerType::get(dstElemTy, srcPtrTy->getAddressSpace());
-              Value *srcTyped = srcPtr;
-              if (srcTyped->getType() != srcTypedPtrTy)
-                srcTyped = CastInst::CreatePointerCast(
-                    srcTyped, srcTypedPtrTy, "tulip.sym.src.typed.cast", CI);
-              auto *typedLoad = new LoadInst(
-                  dstElemTy, srcTyped, "tulip.sym.typed.ld", CI);
-              new StoreInst(typedLoad, dstSymbol, CI);
+            for (uint64_t b = 0; b < copyBytes; ++b) {
+              Value *dstIdx = ConstantInt::get(i64Ty, offBytes + b);
+              Value *srcIdx = ConstantInt::get(i64Ty, b);
+              Value *dstByte = GetElementPtrInst::Create(
+                  i8Ty, dstBytes, {dstIdx}, "tulip.sym.dst.byte", CI);
+              Value *srcByte = GetElementPtrInst::Create(
+                  i8Ty, srcBytes, {srcIdx}, "tulip.sym.src.byte", CI);
+              auto *loadedByte = new LoadInst(i8Ty, srcByte, "tulip.sym.byte.ld", CI);
+              new StoreInst(loadedByte, dstByte, CI);
             }
 
             funcs2delete.insert(calledFunc);
@@ -3266,67 +3309,72 @@ struct MergeKernel : public ModulePass {
          }
      }
 
-    // Split function at synchronization points.
-    // Important: split iteratively using fresh marker discovery each stage.
-    // Reusing stale Instruction* markers after CFG rewrites can collapse later
-    // split stages into trivial entry->return stubs.
-    std::vector<Function*> splitSeeds;
-    splitSeeds.reserve(syncInsts.size());
-    for (auto &[func, insts] : syncInsts) {
-      if (!func || func->isDeclaration()) continue;
-      splitSeeds.push_back(func);
-    }
-    for (Function *func : splitSeeds) {
-      Function *current = func;
-      unsigned stage = 0;
-      while (current && !current->isDeclaration()) {
-        promoteKernelAllocasToSSA(current);
+    if (tulip::isSeparateDeepFissionRequested()) {
+      errs() << "ANDREW: skipping embedded merge-kernel split driver because "
+                "-deep-fission is scheduled separately\n";
+    } else {
+      // Split function at synchronization points.
+      // Important: split iteratively using fresh marker discovery each stage.
+      // Reusing stale Instruction* markers after CFG rewrites can collapse later
+      // split stages into trivial entry->return stubs.
+      std::vector<Function*> splitSeeds;
+      splitSeeds.reserve(syncInsts.size());
+      for (auto &[func, insts] : syncInsts) {
+        if (!func || func->isDeclaration()) continue;
+        splitSeeds.push_back(func);
+      }
+      for (Function *func : splitSeeds) {
+        Function *current = func;
+        unsigned stage = 0;
+        while (current && !current->isDeclaration()) {
+          promoteKernelAllocasToSSA(current);
 
-        std::vector<Instruction*> markers = collectSyncMarkersInFunction(current);
-        if (markers.empty()) break;
+          std::vector<Instruction*> markers = collectSyncMarkersInFunction(current);
+          if (markers.empty()) break;
 
-        auto KCIt = kernelCalls.find(current);
-        if (KCIt == kernelCalls.end() || KCIt->second.empty()) {
-          errs() << "ANDREW: split driver: no kernel callsites recorded for "
-                 << current->getName() << ", stopping staged split\n";
-          break;
-        }
-        std::vector<CallInst*> stageCalls(KCIt->second.begin(), KCIt->second.end());
-        auto &CurrentLI = getAnalysis<LoopInfoWrapperPass>(*current).getLoopInfo();
-        // Split from the earliest reachable non-loop barrier so each stage peels
-        // pre-sync work in program order while avoiding loop-carried markers.
-        Instruction *chosenMarker = nullptr;
-        for (Instruction *marker : markers) {
-          if (!marker || !marker->getParent()) continue;
-          if (!CurrentLI.getLoopFor(marker->getParent())) {
-            chosenMarker = marker;
+          auto KCIt = kernelCalls.find(current);
+          if (KCIt == kernelCalls.end() || KCIt->second.empty()) {
+            errs() << "ANDREW: split driver: no kernel callsites recorded for "
+                   << current->getName() << ", stopping staged split\n";
             break;
           }
-        }
-        if (!chosenMarker) {
+          std::vector<CallInst*> stageCalls(KCIt->second.begin(), KCIt->second.end());
+          auto &CurrentLI = getAnalysis<LoopInfoWrapperPass>(*current).getLoopInfo();
+          // Split from the earliest reachable non-loop barrier so each stage peels
+          // pre-sync work in program order while avoiding loop-carried markers.
+          Instruction *chosenMarker = nullptr;
+          for (Instruction *marker : markers) {
+            if (!marker || !marker->getParent()) continue;
+            if (!CurrentLI.getLoopFor(marker->getParent())) {
+              chosenMarker = marker;
+              break;
+            }
+          }
+          if (!chosenMarker) {
+            errs() << "ANDREW: split driver stage " << stage
+                   << " function=" << current->getName()
+                   << " no non-loop marker -> skip staged split/fission for this function\n";
+            kernelCalls[current].clear();
+            syncInsts[current].clear();
+            break;
+          }
           errs() << "ANDREW: split driver stage " << stage
                  << " function=" << current->getName()
-                 << " no non-loop marker -> skip staged split/fission for this function\n";
+                 << " markers=" << markers.size() << "\n";
+          bool usedReachedSyncGuard = false;
+          Function *next = splitFunction(M.getContext(), current, chosenMarker,
+                                         markers.size(), &usedReachedSyncGuard);
+          if (!next) break;
+
+          for (CallInst *callinst : stageCalls) {
+            if (!callinst || !callinst->getParent()) continue;
+            splitLoop(M.getContext(), callinst, 1);
+          }
           kernelCalls[current].clear();
           syncInsts[current].clear();
-          break;
+          current = next;
+          ++stage;
         }
-        errs() << "ANDREW: split driver stage " << stage
-               << " function=" << current->getName()
-               << " markers=" << markers.size() << "\n";
-        bool usedReachedSyncGuard = false;
-        Function *next = splitFunction(M.getContext(), current, chosenMarker,
-                                       markers.size(), &usedReachedSyncGuard);
-        if (!next) break;
-
-        for (CallInst *callinst : stageCalls) {
-          if (!callinst || !callinst->getParent()) continue;
-          splitLoop(M.getContext(), callinst, 1);
-        }
-        kernelCalls[current].clear();
-        syncInsts[current].clear();
-        current = next;
-        ++stage;
       }
     }
     
